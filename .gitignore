@@ -1,55 +1,29 @@
-# Prerequisites
-*.d
+# Build
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
 
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
+# IDE
+.vs/
+.idea/
+*.swp
+*~
 
-# Linker output
-*.ilk
-*.map
-*.exp
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
 
-# Precompiled Headers
-*.gch
-*.pch
+# Local deploy / secrets
+*.log
+.env
+.env.*
+*.ps1
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# debug information files
-*.dwo
+# NuGet
+*.nupkg
+packages/
+project.lock.json
