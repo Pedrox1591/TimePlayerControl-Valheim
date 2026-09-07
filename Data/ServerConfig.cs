@@ -16,6 +16,12 @@ namespace TimePlayerControl.Data
         public bool EnableClientHud { get; set; } = true;
 
         /// <summary>
+        /// Idioma de textos locales: ES (español) o EN (inglés).
+        /// Cliente = HUD; servidor = mensajes de kick/chat.
+        /// </summary>
+        public string Language { get; set; } = "ES";
+
+        /// <summary>
         /// Ancla del HUD: TopLeft, TopRight, BottomLeft, BottomRight.
         /// HudPositionX/Y se interpretan como margen desde esa esquina.
         /// </summary>
@@ -47,5 +53,23 @@ namespace TimePlayerControl.Data
         /// Tecla para alternar compacto/detalle (nombre KeyCode de Unity, ej: F1, F2, T, Alpha1).
         /// </summary>
         public string HudToggleKey { get; set; } = "F1";
+
+        /// <summary>
+        /// Si es true y no hay posición personalizada, coloca el HUD justo debajo del minimapa
+        /// respetando el HUD scale del juego.
+        /// </summary>
+        public bool HudSnapBelowMinimap { get; set; } = true;
+
+        /// <summary>Separación en px (a 100% HUD scale / 1080p) entre el borde inferior del minimapa y el panel.</summary>
+        public float HudMinimapGap { get; set; } = 8f;
+
+        /// <summary>Si es true, usa HudCustomNormX/Y (posición arrastrada con Escape) en lugar del ancla automática.</summary>
+        public bool HudUseCustomPosition { get; set; } = false;
+
+        /// <summary>Posición X normalizada (0–1) respecto al ancho de pantalla. Usada si HudUseCustomPosition.</summary>
+        public float HudCustomNormX { get; set; } = 0f;
+
+        /// <summary>Posición Y normalizada (0–1) respecto al alto de pantalla. Usada si HudUseCustomPosition.</summary>
+        public float HudCustomNormY { get; set; } = 0f;
     }
 }

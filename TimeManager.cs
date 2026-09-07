@@ -39,6 +39,7 @@ namespace TimePlayerControl
             {
                 ZRoutedRpc.instance.Register(RpcTimeSync, new Action<long, ZPackage>(RPC_TimeSync));
                 ZRoutedRpc.instance.Register(RpcForceMenu, new Action<long, ZPackage>(RPC_ForceMenu));
+                _clientRpcRegistered = true;
                 Plugin.LogInfo("[Client] RPCs registrados en Awake.");
             }
             else
@@ -144,50 +145,68 @@ namespace TimePlayerControl
                 return;
             }
 
-            double remainingSeconds = pkg.ReadDouble();
-            double assignedSeconds = pkg.ReadDouble();
-            double usedSeconds = pkg.ReadDouble();
-            bool exempt = pkg.ReadBool();
-            string nextResetIso = pkg.ReadString();
-            bool showHud = pkg.ReadBool();
-            double totalPlayedSeconds = pkg.ReadDouble();
-            var topPlayers = new List<LeaderboardEntry>();
-            int topCount = pkg.ReadInt();
-            for (int i = 0; i < topCount; i++)
+            try
             {
-                string name = pkg.ReadString();
-                double total = pkg.ReadDouble();
-                topPlayers.Add(new LeaderboardEntry
-                {
-                    PlayerName = string.IsNullOrEmpty(name) ? "Jugador" : name,
-                    TotalPlayedSeconds = Math.Max(0d, total)
-                });
-            }
+                double remainingSeconds = pkg.ReadDouble();
+                double assignedSeconds = pkg.ReadDouble();
+                double usedSeconds = pkg.ReadDouble();
+                bool exempt = pkg.ReadBool();
+                string nextResetIso = pkg.ReadString();
+                bool showHud = pkg.ReadBool();
+                double totalPlayedSeconds = pkg.ReadDouble();
 
-            DateTime? nextReset = null;
-            if (!string.IsNullOrEmpty(nextResetIso))
-            {
-                DateTime parsed;
-                if (DateTime.TryParse(nextResetIso, out parsed))
+                // Aplicar YA los datos críticos (el ranking es opcional y no debe tumbar el HUD).
+                DateTime? nextReset = null;
+                if (!string.IsNullOrEmpty(nextResetIso) && DateTime.TryParse(nextResetIso, out DateTime parsed))
                     nextReset = parsed;
+
+                ClientTimeInfo.CurrentRemainingSeconds = remainingSeconds;
+                ClientTimeInfo.CurrentAssignedSeconds = assignedSeconds;
+                ClientTimeInfo.CurrentMaxSeconds = assignedSeconds;
+                ClientTimeInfo.CurrentUsedSeconds = usedSeconds;
+                ClientTimeInfo.IsExempt = exempt;
+                ClientTimeInfo.NextReset = nextReset;
+                ClientTimeInfo.ShowHud = showHud;
+                ClientTimeInfo.TotalPlayedSeconds = Math.Max(0d, totalPlayedSeconds);
+                ClientTimeInfo.HasReceivedSync = true;
+
+                var topPlayers = new List<LeaderboardEntry>();
+                try
+                {
+                    int topCount = pkg.ReadInt();
+                    if (topCount < 0)
+                        topCount = 0;
+                    if (topCount > 20)
+                        topCount = 20;
+
+                    for (int i = 0; i < topCount; i++)
+                    {
+                        string name = pkg.ReadString();
+                        double total = pkg.ReadDouble();
+                        topPlayers.Add(new LeaderboardEntry
+                        {
+                            PlayerName = string.IsNullOrEmpty(name) ? "Player" : name,
+                            TotalPlayedSeconds = Math.Max(0d, total)
+                        });
+                    }
+                }
+                catch (Exception topEx)
+                {
+                    Plugin.LogDebug($"[Client] Ranking omitido en sync: {topEx.Message}");
+                }
+
+                ClientTimeInfo.TopPlayers = topPlayers;
+                Plugin.LogDebug($"[Client] Sync OK: remaining={remainingSeconds:F0}s, assigned={assignedSeconds:F0}s, used={usedSeconds:F0}s, total={totalPlayedSeconds:F0}s, top={topPlayers.Count}, exempt={exempt}, hud={showHud}");
             }
-
-            ClientTimeInfo.CurrentRemainingSeconds = remainingSeconds;
-            ClientTimeInfo.CurrentAssignedSeconds = assignedSeconds;
-            ClientTimeInfo.CurrentMaxSeconds = assignedSeconds;
-            ClientTimeInfo.CurrentUsedSeconds = usedSeconds;
-            ClientTimeInfo.IsExempt = exempt;
-            ClientTimeInfo.NextReset = nextReset;
-            ClientTimeInfo.ShowHud = showHud;
-            ClientTimeInfo.TotalPlayedSeconds = Math.Max(0d, totalPlayedSeconds);
-            ClientTimeInfo.TopPlayers = topPlayers;
-
-            Plugin.LogDebug($"[Client] Sync recibido: remaining={remainingSeconds:F0}s, assigned={assignedSeconds:F0}s, used={usedSeconds:F0}s, total={totalPlayedSeconds:F0}s, top={topPlayers.Count}, exempt={exempt}, hud={showHud}");
+            catch (Exception ex)
+            {
+                Plugin.LogInfo($"[Client] Error en RPC_TimeSync: {ex.Message}");
+            }
         }
 
         private void RPC_ForceMenu(long sender, ZPackage pkg)
         {
-            string reason = "Te has quedado sin tiempo";
+            string reason = Loc.T("out_of_time");
             if (pkg != null)
             {
                 string payload = pkg.ReadString();
@@ -201,14 +220,47 @@ namespace TimePlayerControl
 
         private IEnumerator ForceReturnToMainMenuRoutine(string reason)
         {
-            string message = string.IsNullOrWhiteSpace(reason) ? "Te has quedado sin tiempo" : reason.Trim();
+            string message = string.IsNullOrWhiteSpace(reason) ? Loc.T("out_of_time") : reason.Trim();
             ClientTimeInfo.PendingMenuMessage = message;
             ClientTimeInfo.PendingMenuMessageUntil = Time.realtimeSinceStartup + 12f;
 
             try
             {
-                if (MessageHud.instance != null)
-                    MessageHud.instance.ShowMessage(MessageHud.MessageType.Center, message);
+                if (MessageHud.instance != null && !string.IsNullOrEmpty(message))
+                {
+                    // Firmas varían entre versiones de Valheim; probar las conocidas.
+                    var hud = MessageHud.instance;
+                    var methods = typeof(MessageHud).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    bool shown = false;
+                    foreach (var method in methods)
+                    {
+                        if (method.Name != "ShowMessage")
+                            continue;
+                        var pars = method.GetParameters();
+                        try
+                        {
+                            if (pars.Length == 2 && pars[0].ParameterType == typeof(MessageHud.MessageType) && pars[1].ParameterType == typeof(string))
+                            {
+                                method.Invoke(hud, new object[] { MessageHud.MessageType.Center, message });
+                                shown = true;
+                                break;
+                            }
+                            if (pars.Length == 3 && pars[0].ParameterType == typeof(MessageHud.MessageType) && pars[1].ParameterType == typeof(string))
+                            {
+                                object third = pars[2].ParameterType.IsValueType ? Activator.CreateInstance(pars[2].ParameterType) : null;
+                                method.Invoke(hud, new object[] { MessageHud.MessageType.Center, message, third });
+                                shown = true;
+                                break;
+                            }
+                        }
+                        catch
+                        {
+                            // probar siguiente overload
+                        }
+                    }
+                    if (!shown)
+                        Plugin.LogDebug("[Client] No se encontro overload compatible de MessageHud.ShowMessage.");
+                }
             }
             catch (Exception ex)
             {
@@ -326,6 +378,10 @@ namespace TimePlayerControl
             if (latest?.ServerConfig == null)
                 return;
 
+            // No pisar la posición mientras el jugador arrastra el HUD.
+            if (_clientHud != null && _clientHud.IsDragging)
+                return;
+
             DataStore.ServerConfig = latest.ServerConfig;
             if (_clientHud != null)
                 _clientHud.InvalidateStyles();
@@ -347,7 +403,7 @@ namespace TimePlayerControl
         {
             kickReason = string.Empty;
             string steamId = GetPeerSteamID(peer);
-            string playerName = string.IsNullOrEmpty(peer.m_playerName) ? "Jugador" : peer.m_playerName;
+            string playerName = string.IsNullOrEmpty(peer.m_playerName) ? Loc.T("player_fallback") : peer.m_playerName;
             DateTime now = DateTime.UtcNow;
             bool pauseActive = IsPauseRuleActive(out _, out _, out _);
 
@@ -392,7 +448,7 @@ namespace TimePlayerControl
 
             if (!playerData.IsExempt && !pauseActive && playerData.RemainingSeconds <= 0)
             {
-                kickReason = "Te has quedado sin tiempo";
+                kickReason = Loc.T("out_of_time");
                 SendForceMenuToPeer(peer, kickReason);
                 Plugin.LogInfo($"[TimePlayerControl] Bloqueando acceso de {playerName} ({steamId}): {kickReason}");
                 return false;
@@ -401,7 +457,7 @@ namespace TimePlayerControl
             if (!playerData.IsExempt && playerData.RemainingSeconds <= 0)
             {
                 DateTime nextResetLocal = playerData.NextResetTime.ToLocalTime();
-                kickReason = $"Te has quedado sin tiempo. Renovacion: {nextResetLocal:dd/MM/yyyy HH:mm}.";
+                kickReason = Loc.Tf("out_of_time_renewal", nextResetLocal.ToString("dd/MM/yyyy HH:mm"));
                 SendForceMenuToPeer(peer, kickReason);
                 return false;
             }
@@ -464,9 +520,9 @@ namespace TimePlayerControl
                 {
                     player.RemainingSeconds = 0;
                     DateTime nextResetLocal = player.NextResetTime.ToLocalTime();
-                    string reason = $"Te has quedado sin tiempo. Proxima renovacion: {nextResetLocal:dd/MM/yyyy HH:mm}.";
+                    string reason = Loc.Tf("out_of_time_next", nextResetLocal.ToString("dd/MM/yyyy HH:mm"));
 
-                    SendCenterMessageToPeer(peer, "Te has quedado sin tiempo");
+                    SendCenterMessageToPeer(peer, Loc.T("out_of_time"));
                     SendForceMenuToPeer(peer, reason);
                     Plugin.LogInfo($"[TimePlayerControl] Jugador {player.PlayerName} ({steamId}) enviado al menu por limite de tiempo.");
 
@@ -479,7 +535,7 @@ namespace TimePlayerControl
                 {
                     player.Warning30MinSent = true;
                     int minutesLeft = Mathf.CeilToInt((float)(player.RemainingSeconds / 60.0));
-                    string warningMsg = $"ATENCION: Te quedan {player.RemainingSeconds:F0} segundos ({minutesLeft} min) de tiempo de juego.";
+                    string warningMsg = Loc.Tf("warning_time", player.RemainingSeconds, minutesLeft);
                     SendCenterMessageToPeer(peer, warningMsg);
                     SendChatMessageToPeer(peer, warningMsg);
                     Plugin.LogInfo($"[TimePlayerControl] Advertencia enviada a {player.PlayerName} ({player.RemainingSeconds:F0}s restantes).");
@@ -524,7 +580,7 @@ namespace TimePlayerControl
                 return;
 
             ZPackage pkg = new ZPackage();
-            pkg.Write(reason ?? "Tiempo agotado");
+            pkg.Write(reason ?? Loc.T("time_exhausted"));
             ZRoutedRpc.instance.InvokeRoutedRPC(peer.m_uid, RpcForceMenu, pkg);
             Plugin.LogInfo($"[Server] Enviado RPC ForceMenu a {peer.m_playerName} ({peer.m_uid}): {reason}");
         }
@@ -555,10 +611,10 @@ namespace TimePlayerControl
             pkg.Write(player.NextResetTime.ToString("O"));
             pkg.Write(showHud);
             pkg.Write(totalPlayedSeconds);
-            pkg.Write(topPlayers.Count);
+            pkg.Write((int)topPlayers.Count);
             foreach (var entry in topPlayers)
             {
-                pkg.Write(entry.PlayerName ?? "Jugador");
+                pkg.Write(entry.PlayerName ?? "Player");
                 pkg.Write(entry.TotalPlayedSeconds);
             }
 
@@ -579,7 +635,7 @@ namespace TimePlayerControl
                 .ThenBy(p => p.PlayerName)
                 .Take(Math.Max(1, maxEntries)))
             {
-                string name = string.IsNullOrWhiteSpace(entry.PlayerName) ? "Jugador" : entry.PlayerName.Trim();
+                string name = string.IsNullOrWhiteSpace(entry.PlayerName) ? Loc.T("player_fallback") : entry.PlayerName.Trim();
                 result.Add(new LeaderboardEntry
                 {
                     PlayerName = name,
@@ -716,9 +772,9 @@ namespace TimePlayerControl
             DataStore.Save();
 
             string steamId = GetPeerSteamID(peer);
-            string stateText = DataStore.ServerConfig.EnableClientHud ? "activado" : "desactivado";
-            SendChatMessageToPeer(peer, $"HUD de tiempo {stateText}.");
-            SendCenterMessageToPeer(peer, $"HUD {stateText}.");
+            string stateText = DataStore.ServerConfig.EnableClientHud ? Loc.T("hud_enabled") : Loc.T("hud_disabled");
+            SendChatMessageToPeer(peer, Loc.Tf("hud_toggle", stateText));
+            SendCenterMessageToPeer(peer, Loc.Tf("hud_toggle_short", stateText));
 
             if (DataStore.Players.TryGetValue(steamId, out var player))
             {
@@ -731,7 +787,7 @@ namespace TimePlayerControl
             string steamId = GetPeerSteamID(peer);
             if (!DataStore.Players.TryGetValue(steamId, out var player))
             {
-                SendChatMessageToPeer(peer, "No se encontró registro de tu usuario.");
+                SendChatMessageToPeer(peer, Loc.T("no_player_record"));
                 return;
             }
 
@@ -740,15 +796,15 @@ namespace TimePlayerControl
             bool isPauseActive = IsPauseRuleActive(out int online, out int registered, out float ratio);
 
             string statusStr = player.IsExempt
-                ? "Tiempo Ilimitado (VIP/Admin)"
+                ? Loc.T("time_unlimited_vip")
                 : $"{ts.Hours}h {ts.Minutes}m {ts.Seconds}s ({player.RemainingSeconds:F0}s)";
 
             string pauseStr = isPauseActive
-                ? $" ( Pausa colectiva ACTIVADA: {online}/{registered} jugadores - {(ratio * 100):F0}%)"
+                ? Loc.Tf("pause_active", online, registered, ratio * 100f)
                 : "";
 
             string totalStr = FormatPlayedTotal(player.TotalPlayedSeconds);
-            string response = $" Tiempo restante: {statusStr}. Total jugado: {totalStr}. Renovación: {resetLocal:dd/MM/yyyy HH:mm}.{pauseStr}";
+            string response = Loc.Tf("time_status", statusStr, totalStr, resetLocal.ToString("dd/MM/yyyy HH:mm"), pauseStr);
             SendChatMessageToPeer(peer, response);
             SendCenterMessageToPeer(peer, response);
         }
@@ -766,26 +822,26 @@ namespace TimePlayerControl
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
             bool isPauseActive = IsPauseRuleActive(out int onlineCount, out int registeredCount, out float ratio);
 
-            string header = $"Jugadores Conectados ({onlineCount}/{registeredCount} - {(ratio * 100):F0}%):";
+            string header = Loc.Tf("players_online", onlineCount, registeredCount, ratio * 100f);
             if (isPauseActive)
             {
-                header += "  [DESCUENTO PAUSADO AL >= 75%]";
+                header += Loc.T("pause_discount");
             }
             SendChatMessageToPeer(peer, header);
 
             foreach (var p in peers)
             {
                 string sId = GetPeerSteamID(p);
-                string pName = string.IsNullOrEmpty(p.m_playerName) ? "Jugador" : p.m_playerName;
+                string pName = string.IsNullOrEmpty(p.m_playerName) ? Loc.T("player_fallback") : p.m_playerName;
                 if (DataStore.Players.TryGetValue(sId, out var data))
                 {
                     TimeSpan ts = TimeSpan.FromSeconds(Math.Max(0, data.RemainingSeconds));
-                    string timeStr = data.IsExempt ? "Ilimitado" : $"{ts.Hours}h {ts.Minutes}m ({data.RemainingSeconds:F0}s)";
+                    string timeStr = data.IsExempt ? Loc.T("unlimited") : $"{ts.Hours}h {ts.Minutes}m ({data.RemainingSeconds:F0}s)";
                     SendChatMessageToPeer(peer, $" - {pName}: {timeStr}");
                 }
                 else
                 {
-                    SendChatMessageToPeer(peer, $" - {pName}: Sin registro");
+                    SendChatMessageToPeer(peer, $" - {pName}: {Loc.T("no_record")}");
                 }
             }
         }
@@ -800,6 +856,7 @@ namespace TimePlayerControl
             public static bool IsExempt { get; set; }
             public static DateTime? NextReset { get; set; }
             public static bool ShowHud { get; set; } = true;
+            public static bool HasReceivedSync { get; set; }
             public static List<LeaderboardEntry> TopPlayers { get; set; } = new List<LeaderboardEntry>();
             public static string PendingMenuMessage { get; set; }
             public static float PendingMenuMessageUntil { get; set; }
@@ -823,9 +880,17 @@ namespace TimePlayerControl
             private float _flashTimer = 0f;
             private float _lastAppliedOpacity = -1f;
             private float _lastUiScale = -1f;
+            private bool _dragging;
+            private Vector2 _dragOffset;
+            private bool _dragMoved;
+            private float _runtimePosX;
+            private float _runtimePosY;
+            private bool _hasRuntimePos;
             private const float FlashInterval = 0.5f;
             private const float ReferenceWidth = 1920f;
             private const float ReferenceHeight = 1080f;
+
+            public bool IsDragging => _dragging;
 
             public void SetEnabled(bool enabled)
             {
@@ -862,7 +927,7 @@ namespace TimePlayerControl
 
             private void Update()
             {
-                if (ClientTimeInfo.CurrentRemainingSeconds <= 30 && !ClientTimeInfo.IsExempt)
+                if (ClientTimeInfo.CurrentRemainingSeconds <= 30 && !ClientTimeInfo.IsExempt && ClientTimeInfo.HasReceivedSync)
                 {
                     _flashTimer += Time.deltaTime;
                     if (_flashTimer >= FlashInterval * 2f)
@@ -924,10 +989,16 @@ namespace TimePlayerControl
                     _compactInitialized = true;
                 }
 
-                if (cfg.HudAutoHideOverlays && IsBlockingGameUiVisible())
+                bool pauseMenuOpen = IsPauseMenuVisible();
+                // Con Escape abierto dejamos el HUD visible para poder arrastrarlo.
+                if (cfg.HudAutoHideOverlays && IsBlockingGameUiVisible(excludePauseMenu: true))
                     return;
 
-                float uiScale = Mathf.Clamp(Mathf.Min(Screen.width / ReferenceWidth, Screen.height / ReferenceHeight), 0.75f, 2.5f);
+                float gameHudScale = GetGameHudScaleFactor();
+                float uiScale = Mathf.Clamp(
+                    Mathf.Min(Screen.width / ReferenceWidth, Screen.height / ReferenceHeight) * gameHudScale,
+                    0.6f,
+                    3f);
                 float opacity = Mathf.Clamp01(cfg.HudOpacity <= 0f ? 0.75f : cfg.HudOpacity);
                 InitializeStyles(uiScale, opacity);
 
@@ -942,48 +1013,88 @@ namespace TimePlayerControl
                 float progressH = 8f * uiScale;
                 float gap = 4f * uiScale;
 
-                bool isAlert = ClientTimeInfo.CurrentRemainingSeconds <= 30 && !ClientTimeInfo.IsExempt;
+                bool isAlert = ClientTimeInfo.HasReceivedSync
+                    && ClientTimeInfo.CurrentRemainingSeconds <= 30
+                    && !ClientTimeInfo.IsExempt;
                 bool showAlertFlash = isAlert && _flashTimer >= FlashInterval;
-                bool showProgress = cfg.HudShowProgressBar && !ClientTimeInfo.IsExempt;
+                bool showProgress = cfg.HudShowProgressBar && !ClientTimeInfo.IsExempt && ClientTimeInfo.HasReceivedSync;
                 string toggleKeyLabel = string.IsNullOrWhiteSpace(cfg.HudToggleKey) ? "F1" : cfg.HudToggleKey.Trim().ToUpperInvariant();
-                int topCount = ClientTimeInfo.TopPlayers != null ? Math.Min(5, ClientTimeInfo.TopPlayers.Count) : 0;
+                int topCount = ClientTimeInfo.HasReceivedSync && ClientTimeInfo.TopPlayers != null
+                    ? Math.Min(5, ClientTimeInfo.TopPlayers.Count)
+                    : 0;
 
                 float contentHeight;
                 if (_compact)
                 {
-                    // Solo cronometro + boton; en alerta el color basta (sin texto extra que se desborde).
                     contentHeight = pad + titleLine + (showProgress ? gap + progressH : 0f) + pad;
+                    if (pauseMenuOpen)
+                        contentHeight += gap + buttonH; // "Bajo mapa"
                 }
                 else
                 {
-                    int detailLines = 5; // restante, asignado, usado, total, renovacion
+                    int detailLines = 5;
+                    if (!ClientTimeInfo.HasReceivedSync)
+                        detailLines += 2; // syncing + no_sync
                     if (ClientTimeInfo.IsExempt || isAlert)
                         detailLines++;
-                    int rankingLines = topCount > 0 ? (1 + topCount) : 0; // titulo + entradas
+                    int rankingLines = topCount > 0 ? (1 + topCount) : 0;
                     contentHeight = pad + titleLine + gap + (detailLines * line) + gap + buttonH + pad;
                     if (showProgress)
                         contentHeight += gap + progressH;
                     if (rankingLines > 0)
                         contentHeight += gap + (rankingLines * line);
+                    if (pauseMenuOpen)
+                        contentHeight += gap + buttonH; // fila "Bajo mapa"
                 }
 
                 float height = cfg.HudHeight > 0f
                     ? Mathf.Max(cfg.HudHeight * uiScale, contentHeight)
                     : contentHeight;
 
-                ResolveAnchoredPosition(cfg.HudAnchor, marginX, marginY, width, height, out float posX, out float posY);
+                ResolveHudPosition(cfg, marginX, marginY, width, height, gameHudScale, out float posX, out float posY);
+
+                // Zonas de botones (se calculan antes del drag para que el clic no lo robe).
+                float textW = width - (pad * 2f);
+                float keyBtnW = 56f * uiScale;
+                Rect expandRect = new Rect(posX + width - pad - keyBtnW, posY + pad, keyBtnW, buttonH);
+                float btnRowY = EstimateButtonRowY(posY, pad, titleLine, gap, line, progressH, buttonH, showProgress, isAlert, topCount, _compact);
+                float compactBtnW = Mathf.Min(130f * uiScale, textW);
+                Rect collapseRect = new Rect(posX + pad, btnRowY, compactBtnW, buttonH);
+                Rect resetRect = new Rect(posX + pad, btnRowY + buttonH + gap, textW, buttonH);
+
+                HandleHudDragging(pauseMenuOpen, ref posX, ref posY, width, height, cfg, expandRect, collapseRect, resetRect);
+
+                // Recalcular rects tras posible drag
+                expandRect = new Rect(posX + width - pad - keyBtnW, posY + pad, keyBtnW, buttonH);
+                btnRowY = EstimateButtonRowY(posY, pad, titleLine, gap, line, progressH, buttonH, showProgress, isAlert, topCount, _compact);
+                collapseRect = new Rect(posX + pad, btnRowY, compactBtnW, buttonH);
+                resetRect = new Rect(posX + pad, btnRowY + buttonH + gap, textW, buttonH);
 
                 Rect panelRect = new Rect(posX, posY, width, height);
                 DrawSemiTransparentBox(panelRect, showAlertFlash ? _bgTextureAlert : _bgTexture);
 
-                string remaining = ClientTimeInfo.IsExempt ? "Ilimitado" : FormatDuration(ClientTimeInfo.CurrentRemainingSeconds);
+                if (pauseMenuOpen)
+                {
+                    Color prev = GUI.color;
+                    GUI.color = new Color(1f, 0.85f, 0.3f, 0.9f);
+                    GUI.Box(panelRect, GUIContent.none);
+                    GUI.color = prev;
+                }
+
+                string remaining = !ClientTimeInfo.HasReceivedSync
+                    ? "—"
+                    : (ClientTimeInfo.IsExempt ? Loc.T("unlimited") : FormatDuration(ClientTimeInfo.CurrentRemainingSeconds));
                 float y = posY + pad;
-                float textW = width - (pad * 2f);
-                float keyBtnW = 56f * uiScale;
 
                 if (_compact)
                 {
-                    string compactText = ClientTimeInfo.IsExempt ? "VIP" : remaining;
+                    string compactText;
+                    if (!ClientTimeInfo.HasReceivedSync)
+                        compactText = Loc.T("syncing");
+                    else if (ClientTimeInfo.IsExempt)
+                        compactText = Loc.T("vip");
+                    else
+                        compactText = remaining;
 
                     Color prev = GUI.contentColor;
                     if (isAlert)
@@ -991,7 +1102,6 @@ namespace TimePlayerControl
                     GUI.Label(new Rect(posX + pad, y, textW - keyBtnW - gap, titleLine), compactText, _compactStyle);
                     GUI.contentColor = prev;
 
-                    Rect expandRect = new Rect(posX + width - pad - keyBtnW, y, keyBtnW, buttonH);
                     if (GUI.Button(expandRect, toggleKeyLabel, _buttonStyle))
                         _compact = false;
 
@@ -1002,10 +1112,16 @@ namespace TimePlayerControl
                         DrawProgressBar(new Rect(posX + pad, y, textW, progressH), GetRemainingRatio(), isAlert);
                     }
 
+                    if (pauseMenuOpen)
+                    {
+                        if (GUI.Button(resetRect, Loc.T("below_map"), _buttonStyle))
+                            ResetHudToMinimap(cfg, marginX, marginY, width, height, gameHudScale);
+                    }
+
                     return;
                 }
 
-                GUI.Label(new Rect(posX + pad, y, textW, titleLine), "Tiempo disponible", _titleStyle);
+                GUI.Label(new Rect(posX + pad, y, textW, titleLine), Loc.T("time_available"), _titleStyle);
                 y += titleLine + gap;
 
                 if (showProgress)
@@ -1014,32 +1130,46 @@ namespace TimePlayerControl
                     y += progressH + gap;
                 }
 
-                string assigned = ClientTimeInfo.IsExempt ? "Ilimitado" : FormatDuration(ClientTimeInfo.CurrentAssignedSeconds);
-                string used = ClientTimeInfo.IsExempt ? "Ilimitado" : FormatDuration(ClientTimeInfo.CurrentUsedSeconds);
-                string totalPlayed = FormatPlayedTotal(ClientTimeInfo.TotalPlayedSeconds);
+                string assigned = !ClientTimeInfo.HasReceivedSync
+                    ? "—"
+                    : (ClientTimeInfo.IsExempt ? Loc.T("unlimited") : FormatDuration(ClientTimeInfo.CurrentAssignedSeconds));
+                string used = !ClientTimeInfo.HasReceivedSync
+                    ? "—"
+                    : (ClientTimeInfo.IsExempt ? Loc.T("unlimited") : FormatDuration(ClientTimeInfo.CurrentUsedSeconds));
+                string totalPlayed = !ClientTimeInfo.HasReceivedSync
+                    ? "—"
+                    : FormatPlayedTotal(ClientTimeInfo.TotalPlayedSeconds);
                 string assignHour = GetAssignmentHourLabel();
 
-                GUI.Label(new Rect(posX + pad, y, textW, line), "Restante: " + remaining, _labelStyle);
+                if (!ClientTimeInfo.HasReceivedSync)
+                {
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("syncing"), _labelStyle);
+                    y += line;
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("no_sync"), _labelStyle);
+                    y += line;
+                }
+
+                GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_remaining", remaining), _labelStyle);
                 y += line;
-                GUI.Label(new Rect(posX + pad, y, textW, line), "Asignado: " + assigned, _labelStyle);
+                GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_assigned", assigned), _labelStyle);
                 y += line;
-                GUI.Label(new Rect(posX + pad, y, textW, line), "Usado: " + used, _labelStyle);
+                GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_used", used), _labelStyle);
                 y += line;
-                GUI.Label(new Rect(posX + pad, y, textW, line), "Total jugado: " + totalPlayed, _labelStyle);
+                GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_total", totalPlayed), _labelStyle);
                 y += line;
-                GUI.Label(new Rect(posX + pad, y, textW, line), "Renovacion: " + assignHour, _labelStyle);
+                GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_renewal", assignHour), _labelStyle);
                 y += line;
 
                 if (ClientTimeInfo.IsExempt)
                 {
-                    GUI.Label(new Rect(posX + pad, y, textW, line), "VIP/Admin", _labelStyle);
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("vip_admin"), _labelStyle);
                     y += line;
                 }
                 else if (isAlert)
                 {
                     Color originalColor = GUI.contentColor;
                     GUI.contentColor = Color.yellow;
-                    GUI.Label(new Rect(posX + pad, y, textW, line), "POCO TIEMPO", _titleStyle);
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("low_time"), _titleStyle);
                     GUI.contentColor = originalColor;
                     y += line;
                 }
@@ -1047,7 +1177,7 @@ namespace TimePlayerControl
                 if (topCount > 0)
                 {
                     y += gap;
-                    GUI.Label(new Rect(posX + pad, y, textW, line), "Top tiempo jugado", _titleStyle);
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("top_played"), _titleStyle);
                     y += line;
                     for (int i = 0; i < topCount; i++)
                     {
@@ -1060,49 +1190,329 @@ namespace TimePlayerControl
                 }
 
                 y += gap;
-                Rect collapseRect = new Rect(posX + pad, y, Mathf.Min(130f * uiScale, textW), buttonH);
-                if (GUI.Button(collapseRect, "Compactar (" + toggleKeyLabel + ")", _buttonStyle))
+                collapseRect = new Rect(posX + pad, y, compactBtnW, buttonH);
+                if (GUI.Button(collapseRect, Loc.Tf("compact_with_key", toggleKeyLabel), _buttonStyle))
                     _compact = true;
+
+                if (pauseMenuOpen)
+                {
+                    resetRect = new Rect(posX + pad, y + buttonH + gap, textW, buttonH);
+                    if (GUI.Button(resetRect, Loc.T("below_map"), _buttonStyle))
+                        ResetHudToMinimap(cfg, marginX, marginY, width, height, gameHudScale);
+                }
             }
 
-            private void DrawPendingMenuMessageIfAny()
+            private static float EstimateButtonRowY(
+                float posY, float pad, float titleLine, float gap, float line, float progressH, float buttonH,
+                bool showProgress, bool isAlert, int topCount, bool compact)
             {
-                if (string.IsNullOrEmpty(ClientTimeInfo.PendingMenuMessage))
-                    return;
-
-                if (Time.realtimeSinceStartup > ClientTimeInfo.PendingMenuMessageUntil)
+                if (compact)
                 {
-                    ClientTimeInfo.PendingMenuMessage = null;
+                    float y = posY + pad + titleLine;
+                    if (showProgress)
+                        y += gap + progressH;
+                    y += gap;
+                    return y;
+                }
+
+                float y2 = posY + pad + titleLine + gap;
+                if (showProgress)
+                    y2 += progressH + gap;
+                int detailLines = 5;
+                if (isAlert || ClientTimeInfo.IsExempt)
+                    detailLines++;
+                y2 += detailLines * line;
+                if (topCount > 0)
+                    y2 += gap + (1 + topCount) * line;
+                y2 += gap;
+                return y2;
+            }
+
+            private void HandleHudDragging(
+                bool pauseMenuOpen,
+                ref float posX,
+                ref float posY,
+                float width,
+                float height,
+                ServerConfig cfg,
+                params Rect[] ignoreRects)
+            {
+                if (!pauseMenuOpen)
+                {
+                    if (_dragging)
+                        EndDrag(posX, posY, width, height, cfg);
                     return;
                 }
 
-                float uiScale = Mathf.Clamp(Mathf.Min(Screen.width / ReferenceWidth, Screen.height / ReferenceHeight), 0.75f, 2.5f);
-                float boxW = Mathf.Min(520f * uiScale, Screen.width - 40f);
-                float boxH = 70f * uiScale;
-                float boxX = (Screen.width - boxW) * 0.5f;
-                float boxY = Screen.height * 0.18f;
+                Event e = Event.current;
+                Rect panelRect = new Rect(posX, posY, width, height);
 
-                if (_bgTexture == null)
-                    _bgTexture = CreateColorTexture(new Color(0.05f, 0.06f, 0.08f, 0.85f));
-                if (_titleStyle == null)
+                if (e.type == EventType.MouseDown && e.button == 0 && panelRect.Contains(e.mousePosition))
                 {
-                    _titleStyle = new GUIStyle(GUI.skin.label);
-                    _titleStyle.normal.textColor = new Color(1f, 0.82f, 0.28f);
-                    _titleStyle.fontSize = Mathf.Max(14, Mathf.RoundToInt(16f * uiScale));
-                    _titleStyle.fontStyle = FontStyle.Bold;
-                    _titleStyle.alignment = TextAnchor.MiddleCenter;
-                    _titleStyle.wordWrap = true;
+                    for (int i = 0; i < ignoreRects.Length; i++)
+                    {
+                        if (ignoreRects[i].width > 1f && ignoreRects[i].Contains(e.mousePosition))
+                            return; // dejar el clic para GUI.Button
+                    }
+
+                    _dragging = true;
+                    _dragMoved = false;
+                    _dragOffset = e.mousePosition - new Vector2(posX, posY);
+                    e.Use();
                 }
 
-                Rect box = new Rect(boxX, boxY, boxW, boxH);
-                DrawSemiTransparentBox(box, _bgTexture);
-                GUI.Label(new Rect(boxX + 12f, boxY + 8f, boxW - 24f, boxH - 16f), ClientTimeInfo.PendingMenuMessage, _titleStyle);
+                if (_dragging && e.type == EventType.MouseDrag)
+                {
+                    Vector2 next = e.mousePosition - _dragOffset;
+                    if (Vector2.Distance(next, new Vector2(posX, posY)) > 1f)
+                        _dragMoved = true;
+                    posX = next.x;
+                    posY = next.y;
+                    ClampHudPosition(ref posX, ref posY, width, height);
+                    _runtimePosX = posX;
+                    _runtimePosY = posY;
+                    _hasRuntimePos = true;
+                    e.Use();
+                }
+
+                if (_dragging && e.type == EventType.MouseUp)
+                {
+                    EndDrag(posX, posY, width, height, cfg);
+                    e.Use();
+                }
+            }
+
+            private void EndDrag(float posX, float posY, float width, float height, ServerConfig cfg)
+            {
+                _dragging = false;
+                ClampHudPosition(ref posX, ref posY, width, height);
+
+                if (!_dragMoved || cfg == null || TimeManager.Instance?.DataStore == null)
+                    return;
+
+                _runtimePosX = posX;
+                _runtimePosY = posY;
+                _hasRuntimePos = true;
+                cfg.HudUseCustomPosition = true;
+                cfg.HudCustomNormX = Screen.width > 0 ? posX / Screen.width : 0f;
+                cfg.HudCustomNormY = Screen.height > 0 ? posY / Screen.height : 0f;
+                TimeManager.Instance.DataStore.ServerConfig = cfg;
+                TimeManager.Instance.DataStore.Save();
+                Plugin.LogInfo($"[Client] HUD reposicionado: norm=({cfg.HudCustomNormX:F3},{cfg.HudCustomNormY:F3})");
+            }
+
+            private void ResetHudToMinimap(ServerConfig cfg, float marginX, float marginY, float width, float height, float gameHudScale)
+            {
+                if (cfg == null || TimeManager.Instance?.DataStore == null)
+                    return;
+
+                cfg.HudUseCustomPosition = false;
+                cfg.HudSnapBelowMinimap = true;
+                cfg.HudCustomNormX = 0f;
+                cfg.HudCustomNormY = 0f;
+                _dragging = false;
+                _dragMoved = false;
+                _hasRuntimePos = false;
+
+                // Aplicar al instante (mismo frame / siguiente paint).
+                ResolveHudPosition(cfg, marginX, marginY, width, height, gameHudScale, out float posX, out float posY);
+                _runtimePosX = posX;
+                _runtimePosY = posY;
+                // Guardar como runtime temporal solo para este frame; sin custom flag.
+                _hasRuntimePos = false;
+
+                TimeManager.Instance.DataStore.ServerConfig = cfg;
+                TimeManager.Instance.DataStore.Save();
+                Plugin.LogInfo($"[Client] HUD reseteado debajo del minimapa @ ({posX:F0},{posY:F0}).");
+            }
+
+            private void ResolveHudPosition(ServerConfig cfg, float marginX, float marginY, float width, float height, float gameHudScale, out float posX, out float posY)
+            {
+                if (_hasRuntimePos && (_dragging || cfg.HudUseCustomPosition))
+                {
+                    posX = _runtimePosX;
+                    posY = _runtimePosY;
+                    ClampHudPosition(ref posX, ref posY, width, height);
+                    return;
+                }
+
+                if (cfg.HudUseCustomPosition)
+                {
+                    posX = Mathf.Clamp01(cfg.HudCustomNormX) * Screen.width;
+                    posY = Mathf.Clamp01(cfg.HudCustomNormY) * Screen.height;
+                    ClampHudPosition(ref posX, ref posY, width, height);
+                    _runtimePosX = posX;
+                    _runtimePosY = posY;
+                    _hasRuntimePos = true;
+                    return;
+                }
+
+                if (cfg.HudSnapBelowMinimap && TryGetMinimapScreenRect(out Rect miniRect))
+                {
+                    float gapPx = Mathf.Max(2f, cfg.HudMinimapGap * gameHudScale * (Screen.height / ReferenceHeight));
+                    posX = miniRect.xMax - width;
+                    posY = miniRect.yMax + gapPx;
+                    ClampHudPosition(ref posX, ref posY, width, height);
+                    return;
+                }
+
+                // Fallback si no se puede leer el minimapa: estimar tamaño tipico @ HUD scale.
+                if (cfg.HudSnapBelowMinimap)
+                {
+                    float estimatedMini = 250f * gameHudScale * (Screen.height / ReferenceHeight);
+                    float edge = 16f * gameHudScale * (Screen.height / ReferenceHeight);
+                    float gapPx = Mathf.Max(2f, cfg.HudMinimapGap * gameHudScale * (Screen.height / ReferenceHeight));
+                    posX = Screen.width - width - edge;
+                    posY = edge + estimatedMini + gapPx;
+                    ClampHudPosition(ref posX, ref posY, width, height);
+                    return;
+                }
+
+                ResolveAnchoredPosition(cfg.HudAnchor, marginX, marginY, width, height, out posX, out posY);
+            }
+
+            private static void ClampHudPosition(ref float posX, ref float posY, float width, float height)
+            {
+                posX = Mathf.Clamp(posX, 8f, Mathf.Max(8f, Screen.width - width - 8f));
+                posY = Mathf.Clamp(posY, 8f, Mathf.Max(8f, Screen.height - height - 8f));
+            }
+
+            /// <summary>
+            /// Factor del HUD scale del juego (1.0 = 100%).
+            /// </summary>
+            private static float GetGameHudScaleFactor()
+            {
+                try
+                {
+                    if (Minimap.instance != null)
+                    {
+                        var field = typeof(Minimap).GetField("m_guiScale", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (field != null)
+                        {
+                            float raw = Convert.ToSingle(field.GetValue(Minimap.instance));
+                            if (raw > 0.01f)
+                                return raw > 5f ? raw / 100f : raw;
+                        }
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        Type t = asm.GetType("GuiScaler") ?? asm.GetType("GUIScaler");
+                        if (t == null)
+                            continue;
+
+                        var prop = t.GetProperty("Scale", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                                   ?? t.GetProperty("GuiScale", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (prop != null)
+                        {
+                            float raw = Convert.ToSingle(prop.GetValue(null, null));
+                            if (raw > 0.01f)
+                                return raw > 5f ? raw / 100f : raw;
+                        }
+
+                        var field = t.GetField("m_largeGuiScale", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                                    ?? t.GetField("m_guiScale", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (field != null)
+                        {
+                            float raw = Convert.ToSingle(field.GetValue(null));
+                            if (raw > 0.01f)
+                                return raw > 5f ? raw / 100f : raw;
+                        }
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    if (PlayerPrefs.HasKey("GuiScale"))
+                    {
+                        float raw = PlayerPrefs.GetFloat("GuiScale", 1f);
+                        if (raw > 0.01f)
+                            return raw > 5f ? raw / 100f : raw;
+                    }
+                }
+                catch { }
+
+                return 1f;
+            }
+
+            /// <summary>
+            /// Rect del minimapa pequeño en coordenadas IMGUI (origen arriba-izquierda).
+            /// </summary>
+            private static bool TryGetMinimapScreenRect(out Rect imguiRect)
+            {
+                imguiRect = default;
+                try
+                {
+                    if (Minimap.instance == null)
+                        return false;
+
+                    RectTransform rt = null;
+                    var smallRootField = typeof(Minimap).GetField("m_smallRoot", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (smallRootField != null)
+                    {
+                        object val = smallRootField.GetValue(Minimap.instance);
+                        if (val is GameObject go && go != null && go.activeInHierarchy)
+                            rt = go.GetComponent<RectTransform>();
+                        else if (val is RectTransform directRt && directRt.gameObject.activeInHierarchy)
+                            rt = directRt;
+                        else if (val is Component comp && comp.gameObject.activeInHierarchy)
+                            rt = comp.GetComponent<RectTransform>() ?? comp.transform as RectTransform;
+                    }
+
+                    if (rt == null)
+                    {
+                        var mapField = typeof(Minimap).GetField("m_mapImageSmall", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (mapField != null)
+                        {
+                            object val = mapField.GetValue(Minimap.instance);
+                            if (val is Component comp)
+                                rt = comp.GetComponent<RectTransform>() ?? comp.transform as RectTransform;
+                        }
+                    }
+
+                    if (rt == null)
+                        return false;
+
+                    Vector3[] corners = new Vector3[4];
+                    rt.GetWorldCorners(corners);
+                    // corners: 0=BL, 1=TL, 2=TR, 3=BR (Unity screen: Y hacia arriba)
+                    float xMin = corners.Min(c => c.x);
+                    float xMax = corners.Max(c => c.x);
+                    float yMinScreen = corners.Min(c => c.y);
+                    float yMaxScreen = corners.Max(c => c.y);
+
+                    float imguiTop = Screen.height - yMaxScreen;
+                    float imguiBottom = Screen.height - yMinScreen;
+                    imguiRect = new Rect(xMin, imguiTop, xMax - xMin, imguiBottom - imguiTop);
+                    return imguiRect.width > 8f && imguiRect.height > 8f;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            private static bool IsPauseMenuVisible()
+            {
+                try
+                {
+                    return Menu.IsVisible();
+                }
+                catch
+                {
+                    return false;
+                }
             }
 
             private static string TruncateName(string name, int maxChars)
             {
                 if (string.IsNullOrEmpty(name))
-                    return "Jugador";
+                    return Loc.T("player_fallback");
                 if (name.Length <= maxChars)
                     return name;
                 return name.Substring(0, Math.Max(1, maxChars - 1)) + "…";
@@ -1141,17 +1551,16 @@ namespace TimePlayerControl
                         break;
                 }
 
-                posX = Mathf.Clamp(posX, 8f, Mathf.Max(8f, Screen.width - width - 8f));
-                posY = Mathf.Clamp(posY, 8f, Mathf.Max(8f, Screen.height - height - 8f));
+                ClampHudPosition(ref posX, ref posY, width, height);
             }
 
-            private static bool IsBlockingGameUiVisible()
+            private static bool IsBlockingGameUiVisible(bool excludePauseMenu = false)
             {
                 try
                 {
                     if (InventoryGui.IsVisible())
                         return true;
-                    if (Menu.IsVisible())
+                    if (!excludePauseMenu && Menu.IsVisible())
                         return true;
                     if (TextInput.IsVisible())
                         return true;
@@ -1168,6 +1577,40 @@ namespace TimePlayerControl
                 }
 
                 return false;
+            }
+
+            private void DrawPendingMenuMessageIfAny()
+            {
+                if (string.IsNullOrEmpty(ClientTimeInfo.PendingMenuMessage))
+                    return;
+
+                if (Time.realtimeSinceStartup > ClientTimeInfo.PendingMenuMessageUntil)
+                {
+                    ClientTimeInfo.PendingMenuMessage = null;
+                    return;
+                }
+
+                float uiScale = Mathf.Clamp(Mathf.Min(Screen.width / ReferenceWidth, Screen.height / ReferenceHeight), 0.75f, 2.5f);
+                float boxW = Mathf.Min(520f * uiScale, Screen.width - 40f);
+                float boxH = 70f * uiScale;
+                float boxX = (Screen.width - boxW) * 0.5f;
+                float boxY = Screen.height * 0.18f;
+
+                if (_bgTexture == null)
+                    _bgTexture = CreateColorTexture(new Color(0.05f, 0.06f, 0.08f, 0.85f));
+                if (_titleStyle == null)
+                {
+                    _titleStyle = new GUIStyle(GUI.skin.label);
+                    _titleStyle.normal.textColor = new Color(1f, 0.82f, 0.28f);
+                    _titleStyle.fontSize = Mathf.Max(14, Mathf.RoundToInt(16f * uiScale));
+                    _titleStyle.fontStyle = FontStyle.Bold;
+                    _titleStyle.alignment = TextAnchor.MiddleCenter;
+                    _titleStyle.wordWrap = true;
+                }
+
+                Rect box = new Rect(boxX, boxY, boxW, boxH);
+                DrawSemiTransparentBox(box, _bgTexture);
+                GUI.Label(new Rect(boxX + 12f, boxY + 8f, boxW - 24f, boxH - 16f), ClientTimeInfo.PendingMenuMessage, _titleStyle);
             }
 
             private static float GetRemainingRatio()

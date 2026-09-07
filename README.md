@@ -41,18 +41,32 @@ Al iniciar se crea:
 
 `BepInEx/config/TimePlayerControl.json`
 
-- **Servidor:** tiempos, resets, jugadores, `TotalPlayedSeconds`
-- **Cliente:** layout del HUD (`HudAnchor`, `HudToggleKey`, opacidad, etc.)
+- **Servidor:** tiempos, resets, jugadores, `TotalPlayedSeconds`, idioma de mensajes (`Language`)
+- **Cliente:** layout del HUD e idioma del HUD (`Language`)
+
+### Idioma
+
+```json
+"Language": "ES"
+```
+
+- `ES` — español (default)
+- `EN` — inglés
+
+El del **cliente** afecta el HUD; el del **servidor** afecta kick/chat/`/tiempo`.
 
 ### HUD (cliente)
 
 | Campo | Descripción |
 |-------|-------------|
+| `Language` | `ES` o `EN` |
 | `HudAnchor` | `TopLeft`, `TopRight`, `BottomLeft`, `BottomRight` |
 | `HudToggleKey` | Tecla para expandir/compactar (ej. `F1`, `F6`) |
 | `HudAutoHideOverlays` | Oculta el HUD con UI del juego |
 | `HudStartCompact` | Empieza en modo compacto |
 | `HudOpacity` | Transparencia (0–1) |
+| `HudSnapBelowMinimap` | Coloca el HUD bajo el minimapa |
+| `HudUseCustomPosition` | Usa posición arrastrada (Escape) |
 
 ### Jugadores (servidor)
 
