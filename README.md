@@ -1,118 +1,77 @@
 # TimePlayerControl
 
-Mod de **Valheim** (BepInEx) que limita el tiempo de juego por jugador, sincroniza el tiempo restante entre servidor y cliente, y muestra un HUD configurable.
+Limita el **tiempo de juego por jugador** en servidores de Valheim (BepInEx). Incluye HUD en cliente, ranking top 5 y desconexión limpia al menú cuando se acaba el tiempo.
 
-## Requisitos
+## Características
 
-- Valheim (cliente y/o servidor dedicado)
-- [BepInEx 5](https://docs.bepinex.dev/) instalado en la carpeta del juego o del servidor
+- Tiempo diario (o por bloque) por SteamID, configurable en JSON
+- HUD compacto / detalle (tecla `F1` por defecto, configurable)
+- Top 5 de mayor tiempo jugado acumulado
+- Auto-ocultado del HUD con inventario, mapa y menú
+- Mensaje *«Te has quedado sin tiempo»* y vuelta al menú de inicio
+- Jugadores VIP/admin exentos (`IsExempt`)
 
 ## Instalación
 
-Copia estos **2 archivos** a la carpeta `BepInEx/plugins` del **cliente** y del **servidor dedicado**:
+### Con gestor (r2modman / Thunderstore Mod Manager)
 
-| Archivo | Origen típico tras compilar |
-|---------|-----------------------------|
-| `TimePlayerControl.dll` | `bin/Debug/net462/` o `bin/Release/net462/` |
-| `Newtonsoft.Json.dll` | misma carpeta de salida del build |
+1. Instala el pack en el **perfil del cliente** y en el del **servidor dedicado**
+2. Asegúrate de que ambos usen la **misma versión** del mod
 
-Rutas de ejemplo:
+### Manual
 
-- Cliente: `...\Valheim\BepInEx\plugins\`
-- Servidor: `...\Valheim dedicated server\BepInEx\plugins\`
+Copia el contenido de `plugins/` a:
 
-Reinicia el cliente y el servidor después de copiar los DLL.
+`BepInEx/plugins/`
+
+Archivos incluidos:
+
+- `TimePlayerControl.dll`
+- `Newtonsoft.Json.dll`
+
+Reinicia cliente y servidor.
+
+## Importante: cliente + servidor
+
+El mod debe estar en **ambos**. El servidor gestiona tiempos y kicks; el cliente muestra el HUD y recibe el sync.
 
 ## Configuración
 
-Al iniciar, el mod crea (o usa) el archivo:
+Al iniciar se crea:
 
 `BepInEx/config/TimePlayerControl.json`
 
-- **Servidor:** controla tiempos, resets, jugadores y ranking (`TotalPlayedSeconds`).
-- **Cliente:** controla sobre todo el layout del HUD (`HudAnchor`, `HudToggleKey`, opacidad, etc.).
+- **Servidor:** tiempos, resets, jugadores, `TotalPlayedSeconds`
+- **Cliente:** layout del HUD (`HudAnchor`, `HudToggleKey`, opacidad, etc.)
 
 ### HUD (cliente)
 
 | Campo | Descripción |
 |-------|-------------|
-| `EnableClientHud` | Activa/desactiva el HUD |
 | `HudAnchor` | `TopLeft`, `TopRight`, `BottomLeft`, `BottomRight` |
-| `HudPositionX` / `HudPositionY` | Márgenes desde el ancla |
-| `HudWidth` | Ancho (referencia 1920×1080) |
-| `HudHeight` | `0` = altura automática |
-| `HudOpacity` | Transparencia del fondo (0–1) |
-| `HudAutoHideOverlays` | Oculta el HUD con inventario, mapa, menú, etc. |
+| `HudToggleKey` | Tecla para expandir/compactar (ej. `F1`, `F6`) |
+| `HudAutoHideOverlays` | Oculta el HUD con UI del juego |
 | `HudStartCompact` | Empieza en modo compacto |
-| `HudShowProgressBar` | Barra de progreso |
-| `HudToggleKey` | Tecla para compactar/expandir (ej. `F1`, `F6`) |
+| `HudOpacity` | Transparencia (0–1) |
 
 ### Jugadores (servidor)
 
-Cada entrada en `Players` incluye, entre otros:
-
 - `RemainingSeconds` / `AssignedSeconds` — bloque actual
-- `TotalPlayedSeconds` — acumulado histórico (no se resetea cada día)
-- `IsExempt` — VIP/admin sin límite
+- `TotalPlayedSeconds` — acumulado (no se resetea cada día)
+- `IsExempt` — sin límite
 - `NextResetTime` — próxima renovación
 
 ## Uso en juego
 
-- **F1** (o la tecla de `HudToggleKey`): alterna HUD compacto / detalle
-- Panel detalle: restante, asignado, usado, total jugado, renovación y **top 5** por tiempo jugado
-- Chat: comandos como `/tiempo` y `/hud` (según los parches del mod)
-- Al agotarse el tiempo: mensaje *«Te has quedado sin tiempo»* y vuelta al menú de inicio
+- **F1** (o tu `HudToggleKey`): compacto ↔ detalle
+- Panel detalle: restante, asignado, usado, total jugado, renovación y **top 5**
+- Chat: `/tiempo`, `/tiempos`, `/hud`
 
-## Compilar (desarrollo)
+## Código fuente
 
-### Requisitos
+https://github.com/Pedrox1591/TimePlayerControl-Valheim
 
-- [.NET SDK](https://dotnet.microsoft.com/download) con soporte para `net462` (SDK 6+ suele bastar)
-- Conexión a internet la primera vez (NuGet restaura BepInEx, UnityEngine.Modules, Valheim.GameLibs, Newtonsoft.Json)
+## Notas
 
-No hace falta tener Valheim instalado en la misma máquina para compilar: las referencias de juego vienen del paquete NuGet `Valheim.GameLibs`.
-
-### Pasos
-
-```bash
-# Desde la raíz del repositorio
-dotnet restore
-dotnet build -c Release
-```
-
-Salida:
-
-```text
-bin/Release/net462/TimePlayerControl.dll
-bin/Release/net462/Newtonsoft.Json.dll
-```
-
-Copia esos 2 DLL a `BepInEx/plugins` (cliente y servidor) como en la sección de instalación.
-
-### Estructura del proyecto
-
-```text
-TimePlayerControl/
-├── Plugin.cs                 # Entrada BepInEx + Harmony
-├── TimeManager.cs            # Lógica de tiempo, RPC y HUD (IMGUI)
-├── Data/
-│   ├── ServerConfig.cs       # Opciones del JSON
-│   ├── PlayerData.cs         # Datos por jugador
-│   └── TimeDataStore.cs      # Carga/guardado de TimePlayerControl.json
-├── Patches/
-│   ├── ChatPatch.cs          # Comandos de chat
-│   └── ZNetPatch.cs          # Conexión / kick
-├── Deploy-TimePlayerControl.ps1
-└── TimePlayerControl.csproj
-```
-
-### Notas para modificar el código
-
-- Target: **.NET Framework 4.6.2** (`net462`), compatible con BepInEx 5 de Valheim.
-- El HUD es **Unity IMGUI** (`OnGUI`), no Canvas.
-- El sync cliente↔servidor usa RPC de Valheim (`TimePlayerControl_TimeSync`, `TimePlayerControl_ForceMenu`).
-- Tras cambiar el protocolo RPC, actualiza **cliente y servidor** con el mismo build.
-
-## Licencia
-
-Usa o adapta el código según tus necesidades. Si publicas un fork, conviene indicar la versión de Valheim / BepInEx con la que lo probaste.
+- Probado con BepInEx 5 (pack Valheim)
+- Tras actualizar el mod, actualiza **cliente y servidor**
