@@ -28,6 +28,7 @@ namespace TimePlayerControl
         private bool _clientRpcRegistered;
         private bool _lastHudEnabledState = true;
         private float _clientConfigCheckTimer = 0f;
+        private bool? _lastPauseActive;
 
         private void Awake()
         {
@@ -154,6 +155,10 @@ namespace TimePlayerControl
                 string nextResetIso = pkg.ReadString();
                 bool showHud = pkg.ReadBool();
                 double totalPlayedSeconds = pkg.ReadDouble();
+                bool pauseActive = pkg.ReadBool();
+                int onlineCount = pkg.ReadInt();
+                int registeredCount = pkg.ReadInt();
+                int pauseNeededCount = pkg.ReadInt();
 
                 // Aplicar YA los datos críticos (el ranking es opcional y no debe tumbar el HUD).
                 DateTime? nextReset = null;
@@ -168,6 +173,10 @@ namespace TimePlayerControl
                 ClientTimeInfo.NextReset = nextReset;
                 ClientTimeInfo.ShowHud = showHud;
                 ClientTimeInfo.TotalPlayedSeconds = Math.Max(0d, totalPlayedSeconds);
+                ClientTimeInfo.PauseActive = pauseActive;
+                ClientTimeInfo.OnlineCount = Math.Max(0, onlineCount);
+                ClientTimeInfo.RegisteredCount = Math.Max(0, registeredCount);
+                ClientTimeInfo.PauseNeededCount = Math.Max(0, pauseNeededCount);
                 ClientTimeInfo.HasReceivedSync = true;
 
                 var topPlayers = new List<LeaderboardEntry>();
@@ -196,7 +205,7 @@ namespace TimePlayerControl
                 }
 
                 ClientTimeInfo.TopPlayers = topPlayers;
-                Plugin.LogDebug($"[Client] Sync OK: remaining={remainingSeconds:F0}s, assigned={assignedSeconds:F0}s, used={usedSeconds:F0}s, total={totalPlayedSeconds:F0}s, top={topPlayers.Count}, exempt={exempt}, hud={showHud}");
+                Plugin.LogDebug($"[Client] Sync OK: remaining={remainingSeconds:F0}s, assigned={assignedSeconds:F0}s, used={usedSeconds:F0}s, total={totalPlayedSeconds:F0}s, top={topPlayers.Count}, exempt={exempt}, hud={showHud}, pause={pauseActive}, players={onlineCount}/{registeredCount}");
             }
             catch (Exception ex)
             {
@@ -462,7 +471,9 @@ namespace TimePlayerControl
                 return false;
             }
 
-            SendPlayerTimeSyncToPeer(peer, playerData);
+            SendPlayerTimeSyncToPeer(peer, playerData, pauseActive);
+            // Refrescar top/HUD del resto (si hay pausa colectiva, el tick no descuenta pero igual debe sincronizar).
+            BroadcastTimeSyncToReadyPeers(excludePeerId: peer.m_uid);
             return true;
         }
 
@@ -482,6 +493,20 @@ namespace TimePlayerControl
             return currentRatio >= DataStore.ServerConfig.PauseTimeMinOnlineRatio;
         }
 
+        private static int GetMinOnlineForPause(int registeredCount, float ratio)
+        {
+            if (registeredCount <= 1)
+                return 0;
+
+            for (int i = 1; i <= registeredCount; i++)
+            {
+                if ((float)i / registeredCount >= ratio)
+                    return i;
+            }
+
+            return registeredCount;
+        }
+
         private void ProcessTimeTick(float deltaSeconds)
         {
             if (ZNet.instance == null) return;
@@ -491,8 +516,13 @@ namespace TimePlayerControl
             bool pauseActive = IsPauseRuleActive(out int onlineCount, out int registeredCount, out float ratio);
             Plugin.LogDebug($"[TimePlayerControl] [TRACE] Tick de control: {peers.Count} conectados, {registeredCount} registrados, ratio={ratio:P0}, pausa_activa={pauseActive}");
 
-            if (pauseActive)
-                return;
+            if (_lastPauseActive == null || _lastPauseActive.Value != pauseActive)
+            {
+                _lastPauseActive = pauseActive;
+                Plugin.LogInfo(pauseActive
+                    ? $"[TimePlayerControl] Pausa colectiva ACTIVADA ({onlineCount}/{registeredCount}, {ratio:P0}). Se deja de descontar tiempo; el sync HUD continua."
+                    : $"[TimePlayerControl] Pausa colectiva DESACTIVADA ({onlineCount}/{registeredCount}, {ratio:P0}). Se reanuda el descuento de tiempo.");
+            }
 
             double warningThresholdSec = DataStore.ServerConfig.WarningThresholdSeconds;
 
@@ -503,18 +533,25 @@ namespace TimePlayerControl
                 string steamId = GetPeerSteamID(peer);
                 if (!DataStore.Players.TryGetValue(steamId, out var player)) continue;
 
-                if (player.IsExempt)
+                if (!pauseActive)
                 {
-                    player.TotalPlayedSeconds += deltaSeconds;
-                    SendPlayerTimeSyncToPeer(peer, player);
-                    continue;
+                    if (player.IsExempt)
+                    {
+                        player.TotalPlayedSeconds += deltaSeconds;
+                    }
+                    else
+                    {
+                        player.RemainingSeconds -= deltaSeconds;
+                        player.TotalPlayedSeconds += deltaSeconds;
+                        Plugin.LogDebug($"[TimePlayerControl] [TRACE] Revisando {player.PlayerName} ({steamId}): restante={player.RemainingSeconds:F0}s, total={player.TotalPlayedSeconds:F0}s, threshold={warningThresholdSec:F0}s, nextReset={player.NextResetTime:O}");
+                    }
                 }
 
-                player.RemainingSeconds -= deltaSeconds;
-                player.TotalPlayedSeconds += deltaSeconds;
-                Plugin.LogDebug($"[TimePlayerControl] [TRACE] Revisando {player.PlayerName} ({steamId}): restante={player.RemainingSeconds:F0}s, total={player.TotalPlayedSeconds:F0}s, threshold={warningThresholdSec:F0}s, nextReset={player.NextResetTime:O}");
+                // Siempre sincronizar (tambien en pausa): top, totales y estado de pausa para el HUD.
+                SendPlayerTimeSyncToPeer(peer, player, pauseActive);
 
-                SendPlayerTimeSyncToPeer(peer, player);
+                if (pauseActive || player.IsExempt)
+                    continue;
 
                 if (player.RemainingSeconds <= 0)
                 {
@@ -526,7 +563,6 @@ namespace TimePlayerControl
                     SendForceMenuToPeer(peer, reason);
                     Plugin.LogInfo($"[TimePlayerControl] Jugador {player.PlayerName} ({steamId}) enviado al menu por limite de tiempo.");
 
-                    // Desconexion suave diferida: el cliente primero vuelve al menu con el mensaje.
                     StartCoroutine(DelayedSoftDisconnect(peer, 2.0f, reason));
                     DataStore.Save();
                     continue;
@@ -540,6 +576,31 @@ namespace TimePlayerControl
                     SendChatMessageToPeer(peer, warningMsg);
                     Plugin.LogInfo($"[TimePlayerControl] Advertencia enviada a {player.PlayerName} ({player.RemainingSeconds:F0}s restantes).");
                 }
+            }
+        }
+
+        public void BroadcastTimeSyncToReadyPeers(long excludePeerId = 0)
+        {
+            if (ZNet.instance == null || DataStore == null)
+                return;
+
+            bool pauseActive = IsPauseRuleActive(out _, out _, out _);
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            if (peers == null)
+                return;
+
+            foreach (var peer in peers)
+            {
+                if (peer == null || !peer.IsReady())
+                    continue;
+                if (excludePeerId != 0 && peer.m_uid == excludePeerId)
+                    continue;
+
+                string steamId = GetPeerSteamID(peer);
+                if (!DataStore.Players.TryGetValue(steamId, out var player))
+                    continue;
+
+                SendPlayerTimeSyncToPeer(peer, player, pauseActive);
             }
         }
 
@@ -585,7 +646,7 @@ namespace TimePlayerControl
             Plugin.LogInfo($"[Server] Enviado RPC ForceMenu a {peer.m_playerName} ({peer.m_uid}): {reason}");
         }
 
-        private static void SendPlayerTimeSyncToPeer(ZNetPeer peer, PlayerData player)
+        private static void SendPlayerTimeSyncToPeer(ZNetPeer peer, PlayerData player, bool pauseActive = false)
         {
             if (peer == null || ZRoutedRpc.instance == null || player == null)
                 return;
@@ -611,6 +672,20 @@ namespace TimePlayerControl
             pkg.Write(player.NextResetTime.ToString("O"));
             pkg.Write(showHud);
             pkg.Write(totalPlayedSeconds);
+            pkg.Write(pauseActive);
+
+            int onlineCount = 0;
+            int registeredCount = 0;
+            if (TimeManager.Instance != null)
+                TimeManager.Instance.IsPauseRuleActive(out onlineCount, out registeredCount, out _);
+
+            // Umbral del JSON (ej. 0.75), no el ratio actual online/registrados.
+            float pauseMinRatio = TimeManager.Instance?.DataStore?.ServerConfig?.PauseTimeMinOnlineRatio ?? 0.75f;
+            int pauseNeededCount = GetMinOnlineForPause(registeredCount, pauseMinRatio);
+
+            pkg.Write(onlineCount);
+            pkg.Write(registeredCount);
+            pkg.Write(pauseNeededCount);
             pkg.Write((int)topPlayers.Count);
             foreach (var entry in topPlayers)
             {
@@ -618,7 +693,7 @@ namespace TimePlayerControl
                 pkg.Write(entry.TotalPlayedSeconds);
             }
 
-            Plugin.LogDebug($"[Server] Enviando sync a {player.PlayerName}: remaining={remainingSeconds:F0}s, assigned={assignedSeconds:F0}s, used={usedSeconds:F0}s, total={totalPlayedSeconds:F0}s, top={topPlayers.Count}, exempt={player.IsExempt}, hud={showHud}");
+            Plugin.LogDebug($"[Server] Enviando sync a {player.PlayerName}: remaining={remainingSeconds:F0}s, assigned={assignedSeconds:F0}s, used={usedSeconds:F0}s, total={totalPlayedSeconds:F0}s, top={topPlayers.Count}, exempt={player.IsExempt}, hud={showHud}, pause={pauseActive}, players={onlineCount}/{registeredCount}");
             ZRoutedRpc.instance.InvokeRoutedRPC(peer.m_uid, RpcTimeSync, pkg);
         }
 
@@ -778,7 +853,8 @@ namespace TimePlayerControl
 
             if (DataStore.Players.TryGetValue(steamId, out var player))
             {
-                SendPlayerTimeSyncToPeer(peer, player);
+                bool pauseActive = IsPauseRuleActive(out _, out _, out _);
+                SendPlayerTimeSyncToPeer(peer, player, pauseActive);
             }
         }
 
@@ -856,6 +932,10 @@ namespace TimePlayerControl
             public static bool IsExempt { get; set; }
             public static DateTime? NextReset { get; set; }
             public static bool ShowHud { get; set; } = true;
+            public static bool PauseActive { get; set; }
+            public static int OnlineCount { get; set; }
+            public static int RegisteredCount { get; set; }
+            public static int PauseNeededCount { get; set; }
             public static bool HasReceivedSync { get; set; }
             public static List<LeaderboardEntry> TopPlayers { get; set; } = new List<LeaderboardEntry>();
             public static string PendingMenuMessage { get; set; }
@@ -874,9 +954,12 @@ namespace TimePlayerControl
             private GUIStyle _compactStyle;
             private Texture2D _bgTexture;
             private Texture2D _bgTextureAlert;
+            private Texture2D _bgTexturePause;
             private Texture2D _progressBgTexture;
             private Texture2D _progressFgTexture;
             private Texture2D _progressAlertTexture;
+            private Texture2D _progressPauseTexture;
+            private Texture2D _buttonBgTexture;
             private float _flashTimer = 0f;
             private float _lastAppliedOpacity = -1f;
             private float _lastUiScale = -1f;
@@ -890,6 +973,17 @@ namespace TimePlayerControl
             private const float ReferenceWidth = 1920f;
             private const float ReferenceHeight = 1080f;
 
+            private static Sprite _valheimPanelSprite;
+            private static float _nextPanelSpriteLookup;
+            private static Font _valheimFont;
+            private static float _nextFontLookup;
+
+            private static readonly Color ValheimGold = new Color(1f, 0.86f, 0.42f, 1f);
+            private static readonly Color ValheimCream = new Color(0.96f, 0.91f, 0.76f, 1f);
+            private static readonly Color PauseTint = new Color(0.62f, 0.88f, 0.48f, 1f);
+            private static readonly Color PauseTintSoft = new Color(0.92f, 0.95f, 0.78f, 1f);
+            private static readonly Color AlertTint = new Color(1f, 0.55f, 0.32f, 1f);
+
             public bool IsDragging => _dragging;
 
             public void SetEnabled(bool enabled)
@@ -901,9 +995,12 @@ namespace TimePlayerControl
             {
                 DestroyTexture(ref _bgTexture);
                 DestroyTexture(ref _bgTextureAlert);
+                DestroyTexture(ref _bgTexturePause);
                 DestroyTexture(ref _progressBgTexture);
                 DestroyTexture(ref _progressFgTexture);
                 DestroyTexture(ref _progressAlertTexture);
+                DestroyTexture(ref _progressPauseTexture);
+                DestroyTexture(ref _buttonBgTexture);
                 _boxStyle = null;
                 _labelStyle = null;
                 _titleStyle = null;
@@ -927,11 +1024,19 @@ namespace TimePlayerControl
 
             private void Update()
             {
-                if (ClientTimeInfo.CurrentRemainingSeconds <= 30 && !ClientTimeInfo.IsExempt && ClientTimeInfo.HasReceivedSync)
+                bool shouldFlash = ClientTimeInfo.HasReceivedSync && (
+                    ClientTimeInfo.PauseActive ||
+                    (ClientTimeInfo.CurrentRemainingSeconds <= 30 && !ClientTimeInfo.IsExempt));
+
+                if (shouldFlash)
                 {
                     _flashTimer += Time.deltaTime;
                     if (_flashTimer >= FlashInterval * 2f)
                         _flashTimer = 0f;
+                }
+                else
+                {
+                    _flashTimer = 0f;
                 }
 
                 if (!_enabled || !ClientTimeInfo.ShowHud || ZNet.instance == null || ZNet.instance.IsServer())
@@ -1006,7 +1111,7 @@ namespace TimePlayerControl
                 float marginY = Mathf.Max(8f, cfg.HudPositionY * uiScale);
                 float width = Mathf.Max(160f * uiScale, cfg.HudWidth * uiScale);
 
-                float pad = 10f * uiScale;
+                float pad = 28f * uiScale;
                 float line = 18f * uiScale;
                 float titleLine = 22f * uiScale;
                 float buttonH = 22f * uiScale;
@@ -1016,26 +1121,40 @@ namespace TimePlayerControl
                 bool isAlert = ClientTimeInfo.HasReceivedSync
                     && ClientTimeInfo.CurrentRemainingSeconds <= 30
                     && !ClientTimeInfo.IsExempt;
-                bool showAlertFlash = isAlert && _flashTimer >= FlashInterval;
+                bool showPause = ClientTimeInfo.HasReceivedSync && ClientTimeInfo.PauseActive;
+                bool showPauseFlash = showPause && _flashTimer >= FlashInterval;
+                bool showAlertFlash = isAlert && !showPause && _flashTimer >= FlashInterval;
                 bool showProgress = cfg.HudShowProgressBar && !ClientTimeInfo.IsExempt && ClientTimeInfo.HasReceivedSync;
                 string toggleKeyLabel = string.IsNullOrWhiteSpace(cfg.HudToggleKey) ? "F1" : cfg.HudToggleKey.Trim().ToUpperInvariant();
                 int topCount = ClientTimeInfo.HasReceivedSync && ClientTimeInfo.TopPlayers != null
                     ? Math.Min(5, ClientTimeInfo.TopPlayers.Count)
                     : 0;
+                bool showPlayers = ClientTimeInfo.HasReceivedSync && ClientTimeInfo.RegisteredCount > 0;
+                bool showPauseHint = showPlayers
+                    && !showPause
+                    && ClientTimeInfo.PauseNeededCount > 1
+                    && ClientTimeInfo.RegisteredCount > 1;
 
                 float contentHeight;
                 if (_compact)
                 {
+                    // Una sola fila: tiempo + jugadores + F1, y la barra debajo.
                     contentHeight = pad + titleLine + (showProgress ? gap + progressH : 0f) + pad;
                     if (pauseMenuOpen)
-                        contentHeight += gap + buttonH; // "Bajo mapa"
+                        contentHeight += gap + buttonH;
                 }
                 else
                 {
                     int detailLines = 5;
                     if (!ClientTimeInfo.HasReceivedSync)
                         detailLines += 2; // syncing + no_sync
+                    if (showPlayers)
+                        detailLines++;
+                    if (showPauseHint)
+                        detailLines++;
                     if (ClientTimeInfo.IsExempt || isAlert)
+                        detailLines++;
+                    if (showPause)
                         detailLines++;
                     int rankingLines = topCount > 0 ? (1 + topCount) : 0;
                     contentHeight = pad + titleLine + gap + (detailLines * line) + gap + buttonH + pad;
@@ -1055,9 +1174,9 @@ namespace TimePlayerControl
 
                 // Zonas de botones (se calculan antes del drag para que el clic no lo robe).
                 float textW = width - (pad * 2f);
-                float keyBtnW = 56f * uiScale;
-                Rect expandRect = new Rect(posX + width - pad - keyBtnW, posY + pad, keyBtnW, buttonH);
-                float btnRowY = EstimateButtonRowY(posY, pad, titleLine, gap, line, progressH, buttonH, showProgress, isAlert, topCount, _compact);
+                float keyBtnW = 48f * uiScale;
+                Rect expandRect = new Rect(posX + width - pad - keyBtnW, posY + pad, keyBtnW, titleLine);
+                float btnRowY = EstimateButtonRowY(posY, pad, titleLine, gap, line, progressH, buttonH, showProgress, isAlert, showPause, showPlayers, showPauseHint, topCount, _compact);
                 float compactBtnW = Mathf.Min(130f * uiScale, textW);
                 Rect collapseRect = new Rect(posX + pad, btnRowY, compactBtnW, buttonH);
                 Rect resetRect = new Rect(posX + pad, btnRowY + buttonH + gap, textW, buttonH);
@@ -1065,21 +1184,19 @@ namespace TimePlayerControl
                 HandleHudDragging(pauseMenuOpen, ref posX, ref posY, width, height, cfg, expandRect, collapseRect, resetRect);
 
                 // Recalcular rects tras posible drag
-                expandRect = new Rect(posX + width - pad - keyBtnW, posY + pad, keyBtnW, buttonH);
-                btnRowY = EstimateButtonRowY(posY, pad, titleLine, gap, line, progressH, buttonH, showProgress, isAlert, topCount, _compact);
+                expandRect = new Rect(posX + width - pad - keyBtnW, posY + pad, keyBtnW, titleLine);
+                btnRowY = EstimateButtonRowY(posY, pad, titleLine, gap, line, progressH, buttonH, showProgress, isAlert, showPause, showPlayers, showPauseHint, topCount, _compact);
                 collapseRect = new Rect(posX + pad, btnRowY, compactBtnW, buttonH);
                 resetRect = new Rect(posX + pad, btnRowY + buttonH + gap, textW, buttonH);
 
                 Rect panelRect = new Rect(posX, posY, width, height);
-                DrawSemiTransparentBox(panelRect, showAlertFlash ? _bgTextureAlert : _bgTexture);
+                Color panelTint = Color.white;
+                if (showPauseFlash)
+                    panelTint = PauseTintSoft;
+                else if (showAlertFlash)
+                    panelTint = new Color(1f, 0.82f, 0.72f, 1f);
 
-                if (pauseMenuOpen)
-                {
-                    Color prev = GUI.color;
-                    GUI.color = new Color(1f, 0.85f, 0.3f, 0.9f);
-                    GUI.Box(panelRect, GUIContent.none);
-                    GUI.color = prev;
-                }
+                DrawValheimPanel(panelRect, panelTint, opacity);
 
                 string remaining = !ClientTimeInfo.HasReceivedSync
                     ? "—"
@@ -1096,11 +1213,27 @@ namespace TimePlayerControl
                     else
                         compactText = remaining;
 
-                    Color prev = GUI.contentColor;
-                    if (isAlert)
-                        GUI.contentColor = Color.yellow;
-                    GUI.Label(new Rect(posX + pad, y, textW - keyBtnW - gap, titleLine), compactText, _compactStyle);
-                    GUI.contentColor = prev;
+                    Color timeColor = ValheimGold;
+                    if (isAlert && !showPause)
+                        timeColor = new Color(1f, 0.78f, 0.35f);
+                    else if (showPause)
+                        timeColor = showPauseFlash ? PauseTint : ValheimGold;
+
+                    float timeW = Mathf.Min(96f * uiScale, textW * 0.48f);
+                    float countW = Mathf.Max(36f * uiScale, textW - timeW - keyBtnW - gap * 2f);
+                    Rect timeRect = new Rect(posX + pad, y, timeW, titleLine);
+                    Rect countRect = new Rect(posX + pad + timeW + gap, y, countW, titleLine);
+
+                    DrawOutlinedLabel(timeRect, compactText, _compactStyle, timeColor);
+
+                    if (showPlayers)
+                    {
+                        string playersText = showPause
+                            ? Loc.Tf("players_pause", ClientTimeInfo.OnlineCount, ClientTimeInfo.RegisteredCount)
+                            : Loc.Tf("label_players_short", ClientTimeInfo.OnlineCount, ClientTimeInfo.RegisteredCount);
+                        Color countColor = showPause ? (showPauseFlash ? PauseTint : ValheimGold) : ValheimCream;
+                        DrawOutlinedLabel(countRect, playersText, _compactStyle, countColor);
+                    }
 
                     if (GUI.Button(expandRect, toggleKeyLabel, _buttonStyle))
                         _compact = false;
@@ -1109,7 +1242,7 @@ namespace TimePlayerControl
                     if (showProgress)
                     {
                         y += gap;
-                        DrawProgressBar(new Rect(posX + pad, y, textW, progressH), GetRemainingRatio(), isAlert);
+                        DrawProgressBar(new Rect(posX + pad, y, textW, progressH), GetRemainingRatio(), isAlert && !showPause, showPause);
                     }
 
                     if (pauseMenuOpen)
@@ -1121,12 +1254,12 @@ namespace TimePlayerControl
                     return;
                 }
 
-                GUI.Label(new Rect(posX + pad, y, textW, titleLine), Loc.T("time_available"), _titleStyle);
+                DrawOutlinedLabel(new Rect(posX + pad, y, textW, titleLine), Loc.T("time_available"), _titleStyle, ValheimGold);
                 y += titleLine + gap;
 
                 if (showProgress)
                 {
-                    DrawProgressBar(new Rect(posX + pad, y, textW, progressH), GetRemainingRatio(), isAlert);
+                    DrawProgressBar(new Rect(posX + pad, y, textW, progressH), GetRemainingRatio(), isAlert && !showPause, showPause);
                     y += progressH + gap;
                 }
 
@@ -1160,17 +1293,41 @@ namespace TimePlayerControl
                 GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_renewal", assignHour), _labelStyle);
                 y += line;
 
+                if (showPlayers)
+                {
+                    Color playerColor = GUI.contentColor;
+                    GUI.contentColor = showPause ? ValheimGold : ValheimCream;
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("label_players", ClientTimeInfo.OnlineCount, ClientTimeInfo.RegisteredCount), _labelStyle);
+                    GUI.contentColor = playerColor;
+                    y += line;
+                }
+
+                if (showPauseHint)
+                {
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.Tf("pause_at", ClientTimeInfo.PauseNeededCount, ClientTimeInfo.RegisteredCount), _labelStyle);
+                    y += line;
+                }
+
                 if (ClientTimeInfo.IsExempt)
                 {
                     GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("vip_admin"), _labelStyle);
                     y += line;
                 }
-                else if (isAlert)
+                else if (isAlert && !showPause)
                 {
                     Color originalColor = GUI.contentColor;
                     GUI.contentColor = Color.yellow;
                     GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("low_time"), _titleStyle);
                     GUI.contentColor = originalColor;
+                    y += line;
+                }
+
+                if (showPause)
+                {
+                    Color pauseColor = GUI.contentColor;
+                    GUI.contentColor = showPauseFlash ? PauseTint : ValheimGold;
+                    GUI.Label(new Rect(posX + pad, y, textW, line), Loc.T("pause_hud"), _titleStyle);
+                    GUI.contentColor = pauseColor;
                     y += line;
                 }
 
@@ -1204,7 +1361,7 @@ namespace TimePlayerControl
 
             private static float EstimateButtonRowY(
                 float posY, float pad, float titleLine, float gap, float line, float progressH, float buttonH,
-                bool showProgress, bool isAlert, int topCount, bool compact)
+                bool showProgress, bool isAlert, bool showPause, bool showPlayers, bool showPauseHint, int topCount, bool compact)
             {
                 if (compact)
                 {
@@ -1219,7 +1376,13 @@ namespace TimePlayerControl
                 if (showProgress)
                     y2 += progressH + gap;
                 int detailLines = 5;
+                if (showPlayers)
+                    detailLines++;
+                if (showPauseHint)
+                    detailLines++;
                 if (isAlert || ClientTimeInfo.IsExempt)
+                    detailLines++;
+                if (showPause)
                     detailLines++;
                 y2 += detailLines * line;
                 if (topCount > 0)
@@ -1654,6 +1817,11 @@ namespace TimePlayerControl
                     _bgTextureAlert = CreateColorTexture(new Color(0.55f, 0.12f, 0.12f, Mathf.Min(1f, opacity + 0.1f)));
                 }
 
+                if (_bgTexturePause == null)
+                {
+                    _bgTexturePause = CreateColorTexture(new Color(0.12f, 0.28f, 0.16f, Mathf.Min(1f, opacity + 0.08f)));
+                }
+
                 if (_progressBgTexture == null)
                 {
                     _progressBgTexture = CreateColorTexture(new Color(0.15f, 0.15f, 0.18f, Mathf.Min(1f, opacity + 0.15f)));
@@ -1661,12 +1829,17 @@ namespace TimePlayerControl
 
                 if (_progressFgTexture == null)
                 {
-                    _progressFgTexture = CreateColorTexture(new Color(0.85f, 0.7f, 0.2f, 0.95f));
+                    _progressFgTexture = CreateColorTexture(new Color(0.78f, 0.62f, 0.28f, 0.95f));
                 }
 
                 if (_progressAlertTexture == null)
                 {
                     _progressAlertTexture = CreateColorTexture(new Color(0.95f, 0.35f, 0.2f, 0.95f));
+                }
+
+                if (_progressPauseTexture == null)
+                {
+                    _progressPauseTexture = CreateColorTexture(new Color(0.45f, 0.82f, 0.42f, 0.95f));
                 }
 
                 int fontSize = Mathf.Max(11, Mathf.RoundToInt(12f * uiScale));
@@ -1684,7 +1857,7 @@ namespace TimePlayerControl
                 if (_titleStyle == null)
                 {
                     _titleStyle = new GUIStyle(GUI.skin.label);
-                    _titleStyle.normal.textColor = new Color(1f, 0.82f, 0.28f);
+                    _titleStyle.normal.textColor = ValheimGold;
                     _titleStyle.fontSize = titleSize;
                     _titleStyle.fontStyle = FontStyle.Bold;
                     _titleStyle.alignment = TextAnchor.MiddleLeft;
@@ -1693,7 +1866,7 @@ namespace TimePlayerControl
                 if (_labelStyle == null)
                 {
                     _labelStyle = new GUIStyle(GUI.skin.label);
-                    _labelStyle.normal.textColor = Color.white;
+                    _labelStyle.normal.textColor = ValheimCream;
                     _labelStyle.fontSize = fontSize;
                     _labelStyle.alignment = TextAnchor.MiddleLeft;
                 }
@@ -1701,11 +1874,16 @@ namespace TimePlayerControl
                 if (_compactStyle == null)
                 {
                     _compactStyle = new GUIStyle(GUI.skin.label);
-                    _compactStyle.normal.textColor = new Color(1f, 0.9f, 0.55f);
+                    _compactStyle.normal.textColor = ValheimGold;
                     _compactStyle.fontSize = compactSize;
                     _compactStyle.fontStyle = FontStyle.Bold;
                     _compactStyle.alignment = TextAnchor.MiddleLeft;
+                    _compactStyle.clipping = TextClipping.Clip;
+                    _compactStyle.wordWrap = false;
                 }
+
+                if (_buttonBgTexture == null)
+                    _buttonBgTexture = CreateColorTexture(new Color(0.22f, 0.15f, 0.09f, 0.92f));
 
                 if (_buttonStyle == null)
                 {
@@ -1713,18 +1891,173 @@ namespace TimePlayerControl
                     _buttonStyle.fontSize = fontSize;
                     _buttonStyle.fontStyle = FontStyle.Bold;
                     _buttonStyle.alignment = TextAnchor.MiddleCenter;
+                    _buttonStyle.normal.textColor = ValheimCream;
+                    _buttonStyle.hover.textColor = ValheimGold;
+                    _buttonStyle.active.textColor = ValheimGold;
+                    _buttonStyle.normal.background = _buttonBgTexture;
+                    _buttonStyle.hover.background = _buttonBgTexture;
+                    _buttonStyle.active.background = _buttonBgTexture;
+                }
+
+                Font vhFont = GetValheimFont();
+                if (vhFont != null)
+                {
+                    _titleStyle.font = vhFont;
+                    _labelStyle.font = vhFont;
+                    _compactStyle.font = vhFont;
+                    _buttonStyle.font = vhFont;
                 }
             }
 
-            private void DrawProgressBar(Rect rect, float ratio, bool alert)
+            private static void DrawOutlinedLabel(Rect rect, string text, GUIStyle style, Color color)
+            {
+                Color prev = GUI.contentColor;
+                GUI.contentColor = new Color(0.08f, 0.05f, 0.02f, 0.85f);
+                GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), text, style);
+                GUI.contentColor = color;
+                GUI.Label(rect, text, style);
+                GUI.contentColor = prev;
+            }
+
+            private void DrawProgressBar(Rect rect, float ratio, bool alert, bool pause)
             {
                 GUI.DrawTexture(rect, _progressBgTexture);
                 float fill = Mathf.Clamp01(ratio) * rect.width;
                 if (fill > 0.5f)
                 {
                     Rect fillRect = new Rect(rect.x, rect.y, fill, rect.height);
-                    GUI.DrawTexture(fillRect, alert ? _progressAlertTexture : _progressFgTexture);
+                    Texture2D fillTex = pause ? _progressPauseTexture : (alert ? _progressAlertTexture : _progressFgTexture);
+                    GUI.DrawTexture(fillRect, fillTex);
                 }
+            }
+
+            private void DrawValheimPanel(Rect rect, Color tint, float opacity)
+            {
+                Sprite panel = GetValheimPanelSprite();
+                if (panel != null && panel.texture != null)
+                {
+                    Color prev = GUI.color;
+                    GUI.color = new Color(tint.r, tint.g, tint.b, Mathf.Clamp01(opacity + 0.18f) * tint.a);
+                    DrawSpriteSimple(rect, panel);
+                    GUI.color = prev;
+                    return;
+                }
+
+                Texture2D fallback = _bgTexture;
+                if (tint == AlertTint)
+                    fallback = _bgTextureAlert;
+                else if (tint == PauseTint || tint == PauseTintSoft)
+                    fallback = _bgTexturePause;
+                DrawSemiTransparentBox(rect, fallback);
+            }
+
+            /// <summary>
+            /// Dibuja el sprite entero (sin 9-slice). Partir el atlas UI de Valheim
+            /// metía líneas de bleed y desplazaba los herrajes.
+            /// </summary>
+            private static void DrawSpriteSimple(Rect dest, Sprite sprite)
+            {
+                Texture tex = sprite.texture;
+                Rect tr = sprite.textureRect;
+                if (tex == null || tr.width < 2f || tr.height < 2f)
+                    return;
+
+                float tw = tex.width;
+                float th = tex.height;
+                float insetU = 1f / tw;
+                float insetV = 1f / th;
+                float u0 = (tr.x / tw) + insetU;
+                float v0 = (tr.y / th) + insetV;
+                float u1 = ((tr.x + tr.width) / tw) - insetU;
+                float v1 = ((tr.y + tr.height) / th) - insetV;
+                if (u1 <= u0 || v1 <= v0)
+                {
+                    u0 = tr.x / tw;
+                    v0 = tr.y / th;
+                    u1 = (tr.x + tr.width) / tw;
+                    v1 = (tr.y + tr.height) / th;
+                }
+
+                GUI.DrawTextureWithTexCoords(dest, tex, new Rect(u0, v0, u1 - u0, v1 - v0));
+            }
+
+            private static Sprite GetValheimPanelSprite()
+            {
+                if (_valheimPanelSprite != null)
+                    return _valheimPanelSprite;
+
+                if (Time.unscaledTime < _nextPanelSpriteLookup)
+                    return null;
+
+                _nextPanelSpriteLookup = Time.unscaledTime + 2f;
+
+                try
+                {
+                    string[] preferred =
+                    {
+                        "woodpanel_info",
+                        "woodpanel_info_180",
+                        "woodpanel_playerinventory",
+                        "panel_bkg_256",
+                        "woodpanel_highres"
+                    };
+
+                    Sprite[] all = Resources.FindObjectsOfTypeAll<Sprite>();
+                    foreach (string name in preferred)
+                    {
+                        foreach (Sprite s in all)
+                        {
+                            if (s != null && string.Equals(s.name, name, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _valheimPanelSprite = s;
+                                Plugin.LogInfo($"[Client] HUD usa sprite del atlas: {s.name}");
+                                return s;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogDebug($"[Client] No se pudo cargar sprite de panel: {ex.Message}");
+                }
+
+                return null;
+            }
+
+            private static Font GetValheimFont()
+            {
+                if (_valheimFont != null)
+                    return _valheimFont;
+
+                if (Time.unscaledTime < _nextFontLookup)
+                    return null;
+
+                _nextFontLookup = Time.unscaledTime + 3f;
+
+                try
+                {
+                    Font averiaBold = null;
+                    Font averia = null;
+                    Font norse = null;
+                    foreach (Font font in Resources.FindObjectsOfTypeAll<Font>())
+                    {
+                        if (font == null)
+                            continue;
+                        string n = font.name ?? string.Empty;
+                        if (n.IndexOf("Averia", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            n.IndexOf("Bold", StringComparison.OrdinalIgnoreCase) >= 0)
+                            averiaBold = font;
+                        else if (n.IndexOf("Averia", StringComparison.OrdinalIgnoreCase) >= 0)
+                            averia = font;
+                        else if (n.IndexOf("Norse", StringComparison.OrdinalIgnoreCase) >= 0)
+                            norse = font;
+                    }
+
+                    _valheimFont = averiaBold ?? averia ?? norse;
+                }
+                catch { }
+
+                return _valheimFont;
             }
 
             private void DrawSemiTransparentBox(Rect rect, Texture2D bgTexture = null)

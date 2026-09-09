@@ -48,6 +48,12 @@ namespace TimePlayerControl
             ["compact_with_key"] = "Compactar ({0})",
             ["syncing"] = "Sincronizando...",
             ["no_sync"] = "Sin datos del servidor",
+            ["pause_hud"] = "Pausa colectiva",
+            ["pause_hud_short"] = "PAUSA",
+            ["label_players"] = "Jugadores: {0}/{1}",
+            ["label_players_short"] = "{0}/{1}",
+            ["pause_at"] = "Pausa a {0}/{1}",
+            ["players_pause"] = "{0}/{1}  ·  PAUSA",
         };
 
         private static readonly Dictionary<string, string> En = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -90,6 +96,12 @@ namespace TimePlayerControl
             ["compact_with_key"] = "Compact ({0})",
             ["syncing"] = "Syncing...",
             ["no_sync"] = "No server data",
+            ["pause_hud"] = "Collective pause",
+            ["pause_hud_short"] = "PAUSE",
+            ["label_players"] = "Players: {0}/{1}",
+            ["label_players_short"] = "{0}/{1}",
+            ["pause_at"] = "Pause at {0}/{1}",
+            ["players_pause"] = "{0}/{1}  ·  PAUSE",
         };
 
         public static string Normalize(string language)
