@@ -26,6 +26,7 @@ namespace TimePlayerControl
         private bool _isClientMode;
         private bool _isServerMode;
         private bool _clientRpcRegistered;
+        private ZRoutedRpc _rpcRegisteredOn;
         private bool _lastHudEnabledState = true;
         private float _clientConfigCheckTimer = 0f;
         private bool? _lastPauseActive;
@@ -36,23 +37,20 @@ namespace TimePlayerControl
             DataStore = TimeDataStore.Load();
             Plugin.LogInfo("[TimeManager] Inicializado correctamente.");
 
-            if (ZRoutedRpc.instance != null)
-            {
-                ZRoutedRpc.instance.Register(RpcTimeSync, new Action<long, ZPackage>(RPC_TimeSync));
-                ZRoutedRpc.instance.Register(RpcForceMenu, new Action<long, ZPackage>(RPC_ForceMenu));
-                _clientRpcRegistered = true;
-                Plugin.LogInfo("[Client] RPCs registrados en Awake.");
-            }
-            else
-            {
+            TryRegisterClientRpcs("Awake");
+            if (!_clientRpcRegistered)
                 Plugin.LogInfo("[Client] ZRoutedRpc.instance es null en Awake, se reintentará en Update.");
-            }
         }
 
         private void Update()
         {
             if (ZNet.instance == null)
+            {
+                // Tras un join fallido (password, timeout) Valheim destruye ZNet/ZRoutedRpc
+                // y crea otros en el siguiente intento. Hay que volver a registrar.
+                ResetClientSessionState();
                 return;
+            }
 
             _isServerMode = ZNet.instance.IsServer();
             _isClientMode = !_isServerMode;
@@ -73,15 +71,44 @@ namespace TimePlayerControl
             }
         }
 
+        private void ResetClientSessionState()
+        {
+            if (!_clientRpcRegistered && !ClientTimeInfo.HasReceivedSync && _rpcRegisteredOn == null)
+                return;
+
+            _clientRpcRegistered = false;
+            _rpcRegisteredOn = null;
+            ClientTimeInfo.HasReceivedSync = false;
+            ClientTimeInfo.PauseActive = false;
+            ClientTimeInfo.TopPlayers = new List<LeaderboardEntry>();
+        }
+
+        private void TryRegisterClientRpcs(string source)
+        {
+            ZRoutedRpc rpc = ZRoutedRpc.instance;
+            if (rpc == null)
+                return;
+            if (_rpcRegisteredOn == rpc)
+                return;
+
+            try
+            {
+                rpc.Register(RpcTimeSync, new Action<long, ZPackage>(RPC_TimeSync));
+                rpc.Register(RpcForceMenu, new Action<long, ZPackage>(RPC_ForceMenu));
+                Plugin.LogInfo($"[Client] RPCs registrados ({source}).");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogDebug($"[Client] Register RPC ({source}): {ex.Message}");
+            }
+
+            _rpcRegisteredOn = rpc;
+            _clientRpcRegistered = true;
+        }
+
         private void EnsureClientRuntime()
         {
-            if (!_clientRpcRegistered && ZRoutedRpc.instance != null)
-            {
-                ZRoutedRpc.instance.Register(RpcTimeSync, new Action<long, ZPackage>(RPC_TimeSync));
-                ZRoutedRpc.instance.Register(RpcForceMenu, new Action<long, ZPackage>(RPC_ForceMenu));
-                _clientRpcRegistered = true;
-                Plugin.LogInfo("[Client] RPCs registrados en EnsureClientRuntime.");
-            }
+            TryRegisterClientRpcs("EnsureClientRuntime");
 
             if (_clientHud == null)
             {
@@ -361,7 +388,7 @@ namespace TimePlayerControl
 
             DataStore.Players = mergedPlayers;
 
-            Plugin.LogDebug($"[TimePlayerControl] [TRACE] Revisión JSON cada {ConfigCheckIntervalSeconds:F0}s: {DataStore.Players.Count} jugadores. save={DataStore.ServerConfig.SaveIntervalSeconds:F0}s, default={DataStore.ServerConfig.DefaultBlockSeconds:F0}s, warning={DataStore.ServerConfig.WarningThresholdSeconds:F0}s");
+            Plugin.LogDebug($"[TimePlayerControl] [TRACE] Revisión JSON cada {ConfigCheckIntervalSeconds:F0}s: {DataStore.Players.Count} jugadores. save={DataStore.ServerConfig.SaveIntervalSeconds:F0}s, default={DataStore.ServerConfig.GetBlockSecondsForNow(DateTime.UtcNow):F0}s, pause={DataStore.ServerConfig.GetPauseRatioForNow(DateTime.UtcNow):P0}, warning={DataStore.ServerConfig.WarningThresholdSeconds:F0}s");
 
             foreach (var kvp in DataStore.Players.OrderBy(x => x.Value.PlayerName))
             {
@@ -432,8 +459,9 @@ namespace TimePlayerControl
                 if (nextReset <= now)
                     nextReset = nextReset.AddDays(1);
 
+                double dayBlockSeconds = DataStore.ServerConfig.GetBlockSecondsForNow(now);
                 double remainingUntilReset = Math.Max(0d, (nextReset - now).TotalSeconds);
-                double assignedSeconds = Math.Min(DataStore.ServerConfig.DefaultBlockSeconds, remainingUntilReset);
+                double assignedSeconds = Math.Min(dayBlockSeconds, remainingUntilReset);
 
                 playerData.AssignedSeconds = assignedSeconds;
                 playerData.RemainingSeconds = assignedSeconds;
@@ -447,11 +475,10 @@ namespace TimePlayerControl
             else
             {
                 playerData.PlayerName = playerName;
-                if (playerData.NeedsReset(now))
+                if (playerData.NeedsReset(now, DataStore.ServerConfig))
                 {
-                    playerData.ResetSeconds(DataStore.ServerConfig.DefaultBlockSeconds, DataStore.ServerConfig.ResetHourUtc, now);
+                    RenewAssignedBlock(playerData, now, steamId);
                     DataStore.Save();
-                    Plugin.LogInfo($"[TimePlayerControl] Tiempo renovado para: {playerName} ({steamId}).");
                 }
             }
 
@@ -490,7 +517,14 @@ namespace TimePlayerControl
             }
 
             currentRatio = (float)onlineCount / registeredCount;
-            return currentRatio >= DataStore.ServerConfig.PauseTimeMinOnlineRatio;
+            return currentRatio >= DataStore.ServerConfig.GetPauseRatioForNow(DateTime.UtcNow);
+        }
+
+        private void RenewAssignedBlock(PlayerData player, DateTime now, string steamId)
+        {
+            double block = DataStore.ServerConfig.GetBlockSecondsForNow(now);
+            player.ResetSeconds(block, DataStore.ServerConfig.ResetHourUtc, now);
+            Plugin.LogInfo($"[TimePlayerControl] Tiempo renovado para {player.PlayerName} ({steamId}): {block:F0}s ({DataStore.ServerConfig.GetPlayDay(now)}).");
         }
 
         private static int GetMinOnlineForPause(int registeredCount, float ratio)
@@ -513,8 +547,10 @@ namespace TimePlayerControl
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
             if (peers == null || peers.Count == 0) return;
 
+            DateTime now = DateTime.UtcNow;
             bool pauseActive = IsPauseRuleActive(out int onlineCount, out int registeredCount, out float ratio);
-            Plugin.LogDebug($"[TimePlayerControl] [TRACE] Tick de control: {peers.Count} conectados, {registeredCount} registrados, ratio={ratio:P0}, pausa_activa={pauseActive}");
+            float pauseMinRatio = DataStore.ServerConfig.GetPauseRatioForNow(now);
+            Plugin.LogDebug($"[TimePlayerControl] [TRACE] Tick de control: {peers.Count} conectados, {registeredCount} registrados, ratio={ratio:P0}, pausa_umbral={pauseMinRatio:P0} ({DataStore.ServerConfig.GetPlayDay(now)}), pausa_activa={pauseActive}");
 
             if (_lastPauseActive == null || _lastPauseActive.Value != pauseActive)
             {
@@ -533,18 +569,19 @@ namespace TimePlayerControl
                 string steamId = GetPeerSteamID(peer);
                 if (!DataStore.Players.TryGetValue(steamId, out var player)) continue;
 
-                if (!pauseActive)
+                if (player.NeedsReset(now, DataStore.ServerConfig))
                 {
-                    if (player.IsExempt)
-                    {
-                        player.TotalPlayedSeconds += deltaSeconds;
-                    }
-                    else
-                    {
-                        player.RemainingSeconds -= deltaSeconds;
-                        player.TotalPlayedSeconds += deltaSeconds;
-                        Plugin.LogDebug($"[TimePlayerControl] [TRACE] Revisando {player.PlayerName} ({steamId}): restante={player.RemainingSeconds:F0}s, total={player.TotalPlayedSeconds:F0}s, threshold={warningThresholdSec:F0}s, nextReset={player.NextResetTime:O}");
-                    }
+                    RenewAssignedBlock(player, now, steamId);
+                    DataStore.Save();
+                }
+
+                // Total jugado siempre corre online, también con pausa colectiva.
+                player.TotalPlayedSeconds += deltaSeconds;
+
+                if (!pauseActive && !player.IsExempt)
+                {
+                    player.RemainingSeconds -= deltaSeconds;
+                    Plugin.LogDebug($"[TimePlayerControl] [TRACE] Revisando {player.PlayerName} ({steamId}): restante={player.RemainingSeconds:F0}s, total={player.TotalPlayedSeconds:F0}s, threshold={warningThresholdSec:F0}s, nextReset={player.NextResetTime:O}");
                 }
 
                 // Siempre sincronizar (tambien en pausa): top, totales y estado de pausa para el HUD.
@@ -651,7 +688,7 @@ namespace TimePlayerControl
             if (peer == null || ZRoutedRpc.instance == null || player == null)
                 return;
 
-            double blockSeconds = TimeManager.Instance?.DataStore?.ServerConfig?.DefaultBlockSeconds ?? 21600;
+            double blockSeconds = TimeManager.Instance?.DataStore?.ServerConfig?.GetBlockSecondsForNow(DateTime.UtcNow) ?? 21600;
             bool showHud = TimeManager.Instance != null && TimeManager.Instance.DataStore != null
                 ? TimeManager.Instance.DataStore.ServerConfig.EnableClientHud
                 : true;
@@ -680,7 +717,7 @@ namespace TimePlayerControl
                 TimeManager.Instance.IsPauseRuleActive(out onlineCount, out registeredCount, out _);
 
             // Umbral del JSON (ej. 0.75), no el ratio actual online/registrados.
-            float pauseMinRatio = TimeManager.Instance?.DataStore?.ServerConfig?.PauseTimeMinOnlineRatio ?? 0.75f;
+            float pauseMinRatio = TimeManager.Instance?.DataStore?.ServerConfig?.GetPauseRatioForNow(DateTime.UtcNow) ?? 0.75f;
             int pauseNeededCount = GetMinOnlineForPause(registeredCount, pauseMinRatio);
 
             pkg.Write(onlineCount);

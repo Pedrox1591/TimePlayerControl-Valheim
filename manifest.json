@@ -1,8 +1,8 @@
 {
   "name": "TimePlayerControl",
-  "version_number": "1.0.2",
+  "version_number": "1.0.3",
   "website_url": "https://github.com/Pedrox1591/TimePlayerControl-Valheim",
-  "description": "Limita el tiempo de juego por jugador en servidores Valheim. HUD configurable, top 5 de tiempo jugado y vuelta al menu al agotar el tiempo.",
+  "description": "Limita el tiempo de juego por jugador en servidores Valheim. HUD, top 5, pausa colectiva, tiempo total acumulado y bloques diarios configurables.",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2202"
   ]

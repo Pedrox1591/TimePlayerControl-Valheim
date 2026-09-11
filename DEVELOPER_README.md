@@ -29,7 +29,7 @@ Al iniciar, el mod crea (o usa) el archivo:
 
 `BepInEx/config/TimePlayerControl.json`
 
-- **Servidor:** controla tiempos, resets, jugadores y ranking (`TotalPlayedSeconds`).
+- **Servidor:** controla tiempos, resets, jugadores, ranking (`TotalPlayedSeconds`) y `DailyRules` (bloque/pausa por día).
 - **Cliente:** controla sobre todo el layout del HUD (`HudAnchor`, `HudToggleKey`, opacidad, etc.).
 
 ### HUD (cliente)
@@ -52,7 +52,7 @@ Al iniciar, el mod crea (o usa) el archivo:
 Cada entrada en `Players` incluye, entre otros:
 
 - `RemainingSeconds` / `AssignedSeconds` — bloque actual
-- `TotalPlayedSeconds` — acumulado histórico (no se resetea cada día)
+- `TotalPlayedSeconds` — acumulado histórico (no se resetea cada día; también suma en pausa colectiva)
 - `IsExempt` — VIP/admin sin límite
 - `NextResetTime` — próxima renovación
 
